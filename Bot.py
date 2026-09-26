@@ -34,7 +34,7 @@ if ADMIN_ID == 0:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ===== FLASK (для Render Web Service) =====
+# ===== FLASK =====
 app = Flask(__name__)
 
 @app.route("/")
@@ -73,7 +73,8 @@ def admin_menu():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ===== СОСТОЯНИЯ =====
-user_states = {}
+user_states = {}        # текущее действие пользователя (product_name, awaiting_search и т.д.)
+admin_sessions = {}     # кто авторизован как админ (ОТДЕЛЬНО!)
 temp_product = {}
 
 # ===== ИНИЦИАЛИЗАЦИЯ БД =====
@@ -104,7 +105,8 @@ def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 def is_admin_state(user_id: int) -> bool:
-    return is_admin(user_id) and user_states.get(user_id) == "admin"
+    """Проверяет, авторизован ли админ (ввёл пароль)."""
+    return is_admin(user_id) and admin_sessions.get(user_id, False)
 
 async def fetch_products():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -136,6 +138,7 @@ def build_catalog_keyboard(products):
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_states.pop(message.from_user.id, None)
+    # admin_sessions НЕ трогаем — админ остаётся админом
     await message.answer(
         f"👋 Привет, {message.from_user.first_name}!\n"
         f"Это S Mod Shop — магазин вейпов.\n"
@@ -360,6 +363,7 @@ async def admin_cmd(message: types.Message):
 async def exit_admin(message: types.Message):
     if not is_admin(message.from_user.id):
         return
+    admin_sessions.pop(message.from_user.id, None)
     user_states.pop(message.from_user.id, None)
     await message.answer("Вышел из админки.", reply_markup=main_menu())
 
@@ -513,7 +517,8 @@ async def handle_input(message: types.Message):
             user_states.pop(user_id, None)
             return
         if message.text.strip() == ADMIN_PASSWORD:
-            user_states[user_id] = "admin"
+            admin_sessions[user_id] = True          # <-- авторизация
+            user_states.pop(user_id, None)          # <-- состояние очищено
             await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
         else:
             user_states.pop(user_id, None)
@@ -553,7 +558,7 @@ async def handle_input(message: types.Message):
             return
         temp_product[user_id]["category"] = message.text
         p = temp_product.pop(user_id, None)
-        user_states[user_id] = "admin"
+        user_states.pop(user_id, None)      # <-- очищаем, админ-статус в admin_sessions
         if p is None:
             await message.answer("❌ Ошибка: данные товара потеряны.", reply_markup=admin_menu())
             return
@@ -573,7 +578,7 @@ async def handle_input(message: types.Message):
     if state == "delete_product":
         if not is_admin_state(user_id):
             return
-        user_states[user_id] = "admin"
+        user_states.pop(user_id, None)
         if not message.text.strip().isdigit():
             await message.answer("❌ ID должен быть числом.", reply_markup=admin_menu())
             return
