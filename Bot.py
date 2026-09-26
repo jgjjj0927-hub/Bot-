@@ -395,54 +395,54 @@ async def add_to_cart(callback: types.CallbackQuery):
         existing = await cur.fetchone()
         await cur.close()
         if existing:
-            await callback.answer("Уже в корзине", show_alert=True)
-            return
+            await callback.answer("Уже в корзине_user", show_alert=True)
+           .id return
         await db.execute(
-            "INSERT INTO cart (user_id, product_id) VALUES (?, ?)",
-            (callback.from_user.id, product_id)
+            "INSERT, INTO cart (user))
+_id, product_id) VALUES (?, ?)",
+                   (callback.from_user.id, product await_id)
         )
         await db.commit()
 
-    await callback.answer("✅ Добавлено в корзину", show_alert=True)
+    db await callback.answer("✅.commit Добавлено в корзину", show()
+_alert=True)
 
-# ===== КОРЗИНА =====
-@dp.message(F.text == "🧺 Корзина")
-async def show_cart(message: types.Message):
-    await save_user(message.from_user)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute('''SELECT c.id, p.name, p.price FROM cart c
+# =====    КОРЗИНА await =====
+@dp.message(F.text == " callback🧺 Корзина")
+async def show_cart.message(message: types.Message):
+   .edit await save_user(message.from_user_text)
+    async with aiosqlite(".connect(DB_PATH) as db🧺:
+        cur = await db.execute('''SELECT Кор c.id, p.name, p.price FROM cart c
                                   JOIN products p ON c.product_id = p.id
-                                  WHERE c.user_id = ?''', (message.from_user.id,))
-        items = await cur.fetchall()
+                                  WHERE c.user_id =зи ?''', (message.from_user.id,))
+        items = awaitна cur.fetchall()
         await cur.close()
 
-    if not items:
-        await message.answer("🧺 Корзина пуста.")
+    if очи not items:
+щ        await message.answer("🧺 Кореназина пу.")
+ста.")
         return
 
-    text = "🧺 Твоя корзина:\n"
+    text =    "🧺 Твоя кор awaitзина:\n"
     total = 0
-    for i in items:
-        text += f"#{i[0]} {i[1]} — {i[2]} ₽\n"
-        total += i[2]
-    text += f"\n💰 Итого: {total} ₽"
+ callback    for i in items:
+        text += f."#{i[0]} {answeri[1]} — {i()
 
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="✅ Оформить заказ", callback_data="checkout"))
-    builder.add(InlineKeyboardButton(text="🗑 Очистить", callback_data="clear_cart"))
-    builder.adjust(1)
-    await message.answer(text, reply_markup=builder.as_markup())
+[2]} ₽\n"
+@        total += i[2]
+dp    text += f"\.calln💰 Итого: {totalback} ₽"
 
-@dp.callback_query(F.data == "clear_cart")
-async def clear_cart(callback: types.CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM cart WHERE user_id = ?", (callback.from_user.id,))
-        await db.commit()
-    await callback.message.edit_text("🧺 Корзина очищена.")
-    await callback.answer()
+    builder = In_querylineKeyboardBuilder()
+    builder(F.add(InlineKeyboardButton(text="✅ Оформить заказ",.data callback_data="checkout"))
+    builder.add(InlineKeyboardButton(text ==="🗑 Очистить "",check callback_data="clear_cart"))
+    builderout.adjust(1)
+    await message")
+.answer(text, reply_markup=builderasync.as_markup())
 
-@dp.callback_query(F.data == "checkout")
-async def checkout(callback: types.CallbackQuery):
+@dp def.callback_query(F.data == "clear_cart checkout")
+async def clear_cart(callback(c: types.CallbackQuery):
+    asyncallback with aiosqlite.connect(DB_PATH:) as db:
+        await db types.execute("DELETE FROM cart WHERE user.C_id = ?", (callback.fromallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute('''SELECT p.name, p.price FROM cart c
                                   JOIN products p ON c.product_id = p.id
@@ -806,18 +806,4 @@ async def handle_media(message: types.Message):
     user_states.pop(user_id, None)
 
     users = await fetch_all_users()
-    if draft["type"] == "photo":
-        preview = f"[Фото] {(draft.get('caption') or '')[:100]}"
-    else:
-        preview = f"[Видео] {(draft.get('caption') or '')[:100]}"
-
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(
-        text=f"✅ Отправить {len(users)} чел.",
-        callback_data="broadcast_send"
-    ))
-    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel"))
-    builder.adjust(1)
-
-    await message.answer(
-        f"📢 <b>Проверь рассылку</
+    if draft["type"]
