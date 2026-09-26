@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # ===== КОНФИГ =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 DB_PATH = "shop.db"
 
 START_TIME = time.time()
@@ -27,8 +27,14 @@ logger = logging.getLogger(__name__)
 # ===== ПРОВЕРКИ =====
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в Environment Variables")
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD не задан в Environment Variables")
 if ADMIN_ID == 0:
     logger.warning("ADMIN_ID = 0. Админ-панель будет недоступна.")
+
+# ===== BOT & DISPATCHER =====
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
 # ===== FLASK (для Render Web Service) =====
 app = Flask(__name__)
@@ -39,7 +45,7 @@ def index():
 
 def run_flask():
     try:
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
     except Exception as e:
         logger.error(f"Flask error: {e}")
 
@@ -49,6 +55,7 @@ BUTTONS = {
     "➕ Добавить товар", "📦 Товары", "🗑 Удалить товар",
     "📋 Заказы", "💬 Тикеты", "📊 Состояние бота", "🔙 Выйти",
 }
+BUTTONS_LIST = list(BUTTONS)
 
 def main_menu():
     kb = [
@@ -86,23 +93,36 @@ async def init_db():
         await db.execute('''CREATE TABLE IF NOT EXISTS tickets
                             (id INTEGER PRIMARY KEY AUTOINCREMENT,
                              user_id INTEGER, message TEXT, answer TEXT)''')
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_cart_user ON cart(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)")
         await db.commit()
 
 # ===== ХЕЛПЕРЫ =====
 def safe_username(user: types.User) -> str:
     return f"@{user.username}" if user.username else f"id{user.id}"
 
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+def is_admin_state(user_id: int) -> bool:
+    return is_admin(user_id) and user_states.get(user_id) == "admin"
+
 async def fetch_products():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, name, price, category FROM products") as cur:
-            return await cur.fetchall()
+        cur = await db.execute("SELECT id, name, price, category FROM products")
+        rows = await cur.fetchall()
+        await cur.close()
+        return rows
 
 async def fetch_product(product_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
+        cur = await db.execute(
             "SELECT name, price, description FROM products WHERE id = ?", (product_id,)
-        ) as cur:
-            return await cur.fetchone()
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
 
 def build_catalog_keyboard(products):
     builder = InlineKeyboardBuilder()
@@ -189,7 +209,7 @@ async def process_buy(callback: types.CallbackQuery):
         await db.commit()
 
     await callback.message.answer(f"✅ Заказ оформлен: {p[0]} за {p[1]} ₽.")
-    if ADMIN_ID:
+    if is_admin(ADMIN_ID):
         try:
             await bot.send_message(
                 ADMIN_ID,
@@ -215,11 +235,12 @@ async def add_to_cart(callback: types.CallbackQuery):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
+        cur = await db.execute(
             "SELECT id FROM cart WHERE user_id = ? AND product_id = ?",
             (callback.from_user.id, product_id)
-        ) as cur:
-            existing = await cur.fetchone()
+        )
+        existing = await cur.fetchone()
+        await cur.close()
         if existing:
             await callback.answer("Уже в корзине", show_alert=True)
             return
@@ -235,10 +256,11 @@ async def add_to_cart(callback: types.CallbackQuery):
 @dp.message(F.text == "🧺 Корзина")
 async def show_cart(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('''SELECT c.id, p.name, p.price FROM cart c
-                                 JOIN products p ON c.product_id = p.id
-                                 WHERE c.user_id = ?''', (message.from_user.id,)) as cur:
-            items = await cur.fetchall()
+        cur = await db.execute('''SELECT c.id, p.name, p.price FROM cart c
+                                  JOIN products p ON c.product_id = p.id
+                                  WHERE c.user_id = ?''', (message.from_user.id,))
+        items = await cur.fetchall()
+        await cur.close()
 
     if not items:
         await message.answer("🧺 Корзина пуста.")
@@ -268,10 +290,11 @@ async def clear_cart(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "checkout")
 async def checkout(callback: types.CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('''SELECT p.name, p.price FROM cart c
-                                 JOIN products p ON c.product_id = p.id
-                                 WHERE c.user_id = ?''', (callback.from_user.id,)) as cur:
-            items = await cur.fetchall()
+        cur = await db.execute('''SELECT p.name, p.price FROM cart c
+                                  JOIN products p ON c.product_id = p.id
+                                  WHERE c.user_id = ?''', (callback.from_user.id,))
+        items = await cur.fetchall()
+        await cur.close()
 
         if not items:
             await callback.answer("Корзина пуста", show_alert=True)
@@ -288,7 +311,7 @@ async def checkout(callback: types.CallbackQuery):
         await db.commit()
 
     await callback.message.answer(f"✅ Заказ оформлен на {total} ₽:\n{products_text}")
-    if ADMIN_ID:
+    if is_admin(ADMIN_ID):
         try:
             await bot.send_message(
                 ADMIN_ID,
@@ -310,8 +333,10 @@ async def search_start(message: types.Message):
 @dp.message(F.text == "👤 Профиль")
 async def profile(message: types.Message):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (message.from_user.id,)) as cur:
-            count = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (message.from_user.id,))
+        row = await cur.fetchone()
+        await cur.close()
+        count = row[0]
     await message.answer(
         f"👤 Твой профиль\n"
         f"ID: {message.from_user.id}\n"
@@ -327,7 +352,7 @@ async def support(message: types.Message):
 # ===== АДМИНКА =====
 @dp.message(Command("admin"))
 async def admin_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         await message.answer("⛔ У тебя нет доступа.")
         return
     user_states[message.from_user.id] = "awaiting_password"
@@ -335,21 +360,23 @@ async def admin_cmd(message: types.Message):
 
 @dp.message(F.text == "🔙 Выйти")
 async def exit_admin(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     user_states.pop(message.from_user.id, None)
     await message.answer("Вышел из админки.", reply_markup=main_menu())
 
 @dp.message(F.text == "➕ Добавить товар")
 async def add_product(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     user_states[message.from_user.id] = "product_name"
     await message.answer("📝 Введи название товара:")
 
 @dp.message(F.text == "🗑 Удалить товар")
 async def delete_product_prompt(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     products = await fetch_products()
     if not products:
@@ -361,7 +388,8 @@ async def delete_product_prompt(message: types.Message):
 
 @dp.message(F.text == "📦 Товары")
 async def list_products(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     products = await fetch_products()
     if not products:
@@ -372,11 +400,13 @@ async def list_products(message: types.Message):
 
 @dp.message(F.text == "📋 Заказы")
 async def list_orders(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, user_id, product, total, status FROM orders ORDER BY id DESC LIMIT 20") as cur:
-            orders = await cur.fetchall()
+        cur = await db.execute("SELECT id, user_id, product, total, status FROM orders ORDER BY id DESC LIMIT 20")
+        orders = await cur.fetchall()
+        await cur.close()
     if not orders:
         await message.answer("Заказов нет.")
         return
@@ -387,11 +417,13 @@ async def list_orders(message: types.Message):
 
 @dp.message(F.text == "💬 Тикеты")
 async def list_tickets(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT id, user_id, message, answer FROM tickets ORDER BY id DESC LIMIT 20") as cur:
-            tickets = await cur.fetchall()
+        cur = await db.execute("SELECT id, user_id, message, answer FROM tickets ORDER BY id DESC LIMIT 20")
+        tickets = await cur.fetchall()
+        await cur.close()
     if not tickets:
         await message.answer("Тикетов нет.")
         return
@@ -402,7 +434,8 @@ async def list_tickets(message: types.Message):
 
 @dp.message(F.text == "📊 Состояние бота")
 async def bot_status(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
         return
     try:
         ram_used = "н/д"
@@ -416,12 +449,15 @@ async def bot_status(message: types.Message):
         minutes = (uptime % 3600) // 60
 
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT COUNT(*) FROM products") as cur:
-                products = (await cur.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM orders") as cur:
-                orders = (await cur.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM tickets") as cur:
-                tickets = (await cur.fetchone())[0]
+            cur = await db.execute("SELECT COUNT(*) FROM products")
+            products = (await cur.fetchone())[0]
+            await cur.close()
+            cur = await db.execute("SELECT COUNT(*) FROM orders")
+            orders = (await cur.fetchone())[0]
+            await cur.close()
+            cur = await db.execute("SELECT COUNT(*) FROM tickets")
+            tickets = (await cur.fetchone())[0]
+            await cur.close()
 
         text = (
             f"📊 Состояние бота\n"
@@ -441,7 +477,7 @@ async def bot_status(message: types.Message):
 
 @dp.message(Command("answer"))
 async def answer_ticket(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if not is_admin(message.from_user.id):
         return
     try:
         parts = message.text.split(" ", 2)
@@ -452,8 +488,9 @@ async def answer_ticket(message: types.Message):
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM tickets WHERE id = ?", (ticket_id,)) as cur:
-            row = await cur.fetchone()
+        cur = await db.execute("SELECT user_id FROM tickets WHERE id = ?", (ticket_id,))
+        row = await cur.fetchone()
+        await cur.close()
         if not row:
             await message.answer("Тикет не найден")
             return
@@ -467,13 +504,16 @@ async def answer_ticket(message: types.Message):
         await message.answer(f"❌ Не удалось отправить: {e}")
 
 # ===== ВВОД ТЕКСТА (В САМОМ КОНЦЕ!) =====
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(BUTTONS))
+@dp.message(F.text, ~F.text.startswith("/"), ~F.text.in_(BUTTONS_LIST))
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
     # Пароль
     if state == "awaiting_password":
+        if not is_admin(user_id):
+            user_states.pop(user_id, None)
+            return
         if message.text.strip() == ADMIN_PASSWORD:
             user_states[user_id] = "admin"
             await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
@@ -484,12 +524,16 @@ async def handle_input(message: types.Message):
 
     # Добавление товара
     if state == "product_name":
+        if not is_admin_state(user_id):
+            return
         temp_product[user_id] = {"name": message.text}
         user_states[user_id] = "product_price"
         await message.answer("💰 Введи цену (только число):")
         return
 
     if state == "product_price":
+        if not is_admin_state(user_id):
+            return
         if not message.text.strip().isdigit():
             await message.answer("❌ Цена должна быть числом. Попробуй снова:")
             return
@@ -499,15 +543,22 @@ async def handle_input(message: types.Message):
         return
 
     if state == "product_desc":
+        if not is_admin_state(user_id):
+            return
         temp_product[user_id]["desc"] = message.text
         user_states[user_id] = "product_category"
         await message.answer("📂 Введи категорию (моды, жидкости, аксессуары):")
         return
 
     if state == "product_category":
+        if not is_admin_state(user_id):
+            return
         temp_product[user_id]["category"] = message.text
-        p = temp_product.pop(user_id)
+        p = temp_product.pop(user_id, None)
         user_states[user_id] = "admin"
+        if p is None:
+            await message.answer("❌ Ошибка: данные товара потеряны.", reply_markup=admin_menu())
+            return
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 await db.execute(
@@ -522,6 +573,8 @@ async def handle_input(message: types.Message):
 
     # Удаление товара
     if state == "delete_product":
+        if not is_admin_state(user_id):
+            return
         user_states[user_id] = "admin"
         if not message.text.strip().isdigit():
             await message.answer("❌ ID должен быть числом.", reply_markup=admin_menu())
@@ -538,11 +591,12 @@ async def handle_input(message: types.Message):
     if state == "awaiting_search":
         user_states.pop(user_id, None)
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
+            cur = await db.execute(
                 "SELECT id, name, price FROM products WHERE name LIKE ?",
                 (f"%{message.text}%",)
-            ) as cur:
-                results = await cur.fetchall()
+            )
+            results = await cur.fetchall()
+            await cur.close()
         if not results:
             await message.answer("❌ Ничего не найдено.")
             return
@@ -554,13 +608,14 @@ async def handle_input(message: types.Message):
     if state == "awaiting_support":
         user_states.pop(user_id, None)
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
+            cur = await db.execute(
                 "INSERT INTO tickets (user_id, message) VALUES (?, ?)",
                 (user_id, message.text)
-            ) as cur:
-                ticket_id = cur.lastrowid
+            )
+            ticket_id = cur.lastrowid
+            await cur.close()
             await db.commit()
-        if ADMIN_ID:
+        if is_admin(ADMIN_ID):
             try:
                 await bot.send_message(
                     ADMIN_ID,
@@ -580,7 +635,10 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     Thread(target=run_flask, daemon=True).start()
     logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     try:
