@@ -10,585 +10,473 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
-DB_PATH = os.getenv("DB_PATH", "shop.db")
-BACKUP_DIR = "backups"
-BACKUP_INTERVAL_MIN = 30
-BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0"))
-START_TIME = time.time()
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN не задан")
-if ADMIN_ID == 0:
-    logger.warning("ADMIN_ID = 0")
-if BACKUP_CHANNEL_ID == 0:
-    logger.warning("BACKUP_CHANNEL_ID не задан — авто-восстановление выключено")
-
-os.makedirs(BACKUP_DIR, exist_ok=True)
-
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
-app = Flask(__name__)
+T=os.getenv("BOT_TOKEN"); AID=int(os.getenv("ADMIN_ID","0")); PWD=os.getenv("ADMIN_PASSWORD","96266")
+DB=os.getenv("DB_PATH","shop.db"); BD="backups"; BIM=30
+CH=int(os.getenv("BACKUP_CHANNEL_ID","0")); ST=time.time()
+logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s"); log=logging.getLogger("bot")
+if not T: raise RuntimeError("BOT_TOKEN не задан")
+os.makedirs(BD,exist_ok=True)
+bot=Bot(token=T,default=DefaultBotProperties(parse_mode="HTML")); dp=Dispatcher(); app=Flask(__name__)
 
 @app.route("/")
-def index():
-    return "Bot is running"
+def idx(): return "OK"
 
 def run_flask():
+    try: app.run(host="0.0.0.0",port=int(os.getenv("PORT",10000)),use_reloader=False)
+    except Exception as e: log.error(f"flask:{e}")
+
+BTNS={"🛒 Заказать","🔍 Поиск","🧺 Корзина","👤 Профиль","🆘 Поддержка","➕ Добавить товар",
+"📦 Товары","🗑 Удалить товар","📋 Заказы","💬 Тикеты","📊 Состояние бота","💾 Бэкап","📢 Рассылка","🔙 Выйти"}
+BTNS_L=list(BTNS)
+
+def mmenu(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🛒 Заказать"),KeyboardButton(text="🔍 Поиск")],[KeyboardButton(text="🧺 Корзина"),KeyboardButton(text="👤 Профиль")],[KeyboardButton(text="🆘 Поддержка")]],resize_keyboard=True)
+def amenu(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="➕ Добавить товар")],[KeyboardButton(text="📦 Товары"),KeyboardButton(text="🗑 Удалить товар")],[KeyboardButton(text="📋 Заказы"),KeyboardButton(text="💬 Тикеты")],[KeyboardButton(text="📢 Рассылка"),KeyboardButton(text="📊 Состояние бота")],[KeyboardButton(text="💾 Бэкап"),KeyboardButton(text="🔙 Выйти")]],resize_keyboard=True)
+
+US={}; AS={}; TP={}; TB={}
+REQ=["products","orders","cart","tickets","users"]
+
+async def idb():
+    async with aiosqlite.connect(DB) as d:
+        await d.execute("CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,price INTEGER,description TEXT,category TEXT)")
+        await d.execute("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product TEXT,total INTEGER,status TEXT)")
+        await d.execute("CREATE TABLE IF NOT EXISTS cart(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product_id INTEGER)")
+        await d.execute("CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,answer TEXT)")
+        await d.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,full_name TEXT,first_seen TEXT)")
+        await d.commit()
+        c=await d.execute("SELECT COUNT(*) FROM users"); n=(await c.fetchone())[0]; await c.close()
+        if n==0:
+            await d.execute("INSERT OR IGNORE INTO users SELECT DISTINCT user_id,'','','' FROM orders")
+            await d.execute("INSERT OR IGNORE INTO users SELECT DISTINCT user_id,'','','' FROM tickets")
+            await d.commit()
+
+async def healthy():
+    if not os.path.exists(DB): return False
     try:
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
-    except Exception as e:
-        logger.error(f"Flask: {e}")
+        async with aiosqlite.connect(DB) as d:
+            c=await d.execute("SELECT name FROM sqlite_master WHERE type='table'"); ts={r[0] for r in await c.fetchall()}; await c.close()
+        return all(t in ts for t in REQ)
+    except: return False
 
-BUTTONS = {"🛒 Заказать","🔍 Поиск","🧺 Корзина","👤 Профиль","🆘 Поддержка",
-"➕ Добавить товар","📦 Товары","🗑 Удалить товар","📋 Заказы","💬 Тикеты",
-"📊 Состояние бота","💾 Бэкап","📢 Рассылка","🔙 Выйти"}
-BUTTONS_LIST = list(BUTTONS)
-
-def main_menu():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🛒 Заказать"), KeyboardButton(text="🔍 Поиск")],
-        [KeyboardButton(text="🧺 Корзина"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="🆘 Поддержка")],
-    ], resize_keyboard=True)
-
-def admin_menu():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="➕ Добавить товар")],
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="🗑 Удалить товар")],
-        [KeyboardButton(text="📋 Заказы"), KeyboardButton(text="💬 Тикеты")],
-        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="📊 Состояние бота")],
-        [KeyboardButton(text="💾 Бэкап"), KeyboardButton(text="🔙 Выйти")],
-    ], resize_keyboard=True)
-
-user_states = {}
-admin_sessions = {}
-temp_product = {}
-temp_broadcast = {}
-
-REQUIRED_TABLES = ["products", "orders", "cart", "tickets", "users"]
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,price INTEGER,description TEXT,category TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product TEXT,total INTEGER,status TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS cart(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,product_id INTEGER)")
-        await db.execute("CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,answer TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,full_name TEXT,first_seen TEXT)")
-        await db.commit()
-        try:
-            cur = await db.execute("SELECT COUNT(*) FROM users")
-            cnt = (await cur.fetchone())[0]
-            await cur.close()
-            if cnt == 0:
-                await db.execute("INSERT OR IGNORE INTO users(user_id, username, full_name, first_seen) SELECT DISTINCT user_id, '', '', '' FROM orders")
-                await db.execute("INSERT OR IGNORE INTO users(user_id, username, full_name, first_seen) SELECT DISTINCT user_id, '', '', '' FROM tickets")
-                await db.commit()
-                logger.info("users заполнена из orders/tickets")
-        except Exception as e:
-            logger.error(f"init_db users migrate: {e}")
-
-async def db_is_healthy():
-    """Все ли нужные таблицы есть в базе."""
-    if not os.path.exists(DB_PATH):
-        return False
+async def has_data():
+    if not os.path.exists(DB): return False
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {r[0] for r in await cur.fetchall()}
-            await cur.close()
-        missing = [t for t in REQUIRED_TABLES if t not in tables]
-        if missing:
-            logger.warning(f"В базе нет таблиц: {missing}")
-            return False
-        return True
-    except Exception as e:
-        logger.error(f"db_is_healthy: {e}")
-        return False
-
-async def db_has_data():
-    """Есть ли в базе живые данные (товары/заказы/тикеты)."""
-    if not os.path.exists(DB_PATH):
-        return False
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            for t in ["orders", "products", "tickets"]:
+        async with aiosqlite.connect(DB) as d:
+            for t in ["orders","products","tickets"]:
                 try:
-                    cur = await db.execute(f"SELECT COUNT(*) FROM {t}")
-                    cnt = (await cur.fetchone())[0]
-                    await cur.close()
-                    if cnt > 0:
-                        return True
-                except Exception:
-                    pass
+                    c=await d.execute(f"SELECT COUNT(*) FROM {t}"); n=(await c.fetchone())[0]; await c.close()
+                    if n>0: return True
+                except: pass
         return False
-    except Exception:
-        return False
+    except: return False
 
-async def restore_from_channel():
-    """Скачивает закреплённый .db из канала и подменяет shop.db."""
-    if BACKUP_CHANNEL_ID == 0:
-        logger.warning("BACKUP_CHANNEL_ID не задан")
-        return False
+async def restore_ch():
+    if CH==0: return False
     try:
-        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
-        pinned = chat.pinned_message
-        if not pinned or not pinned.document:
-            logger.warning("В канале нет закреплённого .db")
-            return False
+        ch=await bot.get_chat(CH); pm=ch.pinned_message
+        if not pm or not pm.document or not pm.document.file_name.endswith(".db"): return False
+        f=await bot.get_file(pm.document.file_id); tmp="rc.db"; await bot.download_file(f.file_path,tmp)
+        if os.path.exists(DB): shutil.copy2(DB,DB+".before")
+        shutil.move(tmp,DB); log.info("restored from channel"); return True
+    except Exception as e: log.error(f"restore_ch:{e}"); return False
 
-        doc = pinned.document
-        if not doc.file_name.endswith(".db"):
-            logger.warning(f"Закреплённый файл не .db: {doc.file_name}")
-            return False
+def su(u): return f"@{u.username}" if u.username else f"id{u.id}"
+def adm(u): return AID!=0 and u==AID
+def ast(u): return adm(u) and AS.get(u,False)
 
-        file = await bot.get_file(doc.file_id)
-        tmp = "restore_from_channel.db"
-        await bot.download_file(file.file_path, tmp)
-
-        async with aiosqlite.connect(tmp) as t:
-            cur = await t.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = await cur.fetchall()
-            await cur.close()
-        if not tables:
-            logger.warning("Скачанный файл пустой")
-            os.remove(tmp)
-            return False
-
-        if os.path.exists(DB_PATH):
-            shutil.copy2(DB_PATH, f"{DB_PATH}.before_auto_restore")
-        shutil.move(tmp, DB_PATH)
-        logger.info(f"✅ База восстановлена из канала ({len(tables)} таблиц)")
-        return True
-    except Exception as e:
-        logger.error(f"restore_from_channel: {e}")
-        return False
-
-def safe_username(u): return f"@{u.username}" if u.username else f"id{u.id}"
-def is_admin(uid): return ADMIN_ID != 0 and uid == ADMIN_ID
-def is_admin_state(uid): return is_admin(uid) and admin_sessions.get(uid, False)
-
-async def save_user(u):
+async def save_u(u):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR IGNORE INTO users VALUES (?,?,?,?)",(u.id,u.username or "",u.full_name or "",datetime.now().isoformat()))
-            await db.execute("UPDATE users SET username=?,full_name=? WHERE user_id=?",(u.username or "",u.full_name or "",u.id))
-            await db.commit()
-    except Exception as e: logger.error(f"save_user: {e}")
+        async with aiosqlite.connect(DB) as d:
+            await d.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,?)",(u.id,u.username or "",u.full_name or "",datetime.now().isoformat()))
+            await d.execute("UPDATE users SET username=?,full_name=? WHERE user_id=?",(u.username or "",u.full_name or "",u.id)); await d.commit()
+    except Exception as e: log.error(f"save_u:{e}")
 
-async def fetch_all_users():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM users UNION SELECT user_id FROM orders UNION SELECT user_id FROM tickets")
-        rows = await cur.fetchall(); await cur.close()
-        return [r[0] for r in rows if r[0] != ADMIN_ID]
+async def all_u():
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT user_id FROM users UNION SELECT user_id FROM orders UNION SELECT user_id FROM tickets")
+        r=await c.fetchall(); await c.close(); return [x[0] for x in r if x[0]!=AID]
 
-async def fetch_products():
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id,name,price,category FROM products")
-        rows = await cur.fetchall(); await cur.close(); return rows
+async def prods():
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT id,name,price,category FROM products"); r=await c.fetchall(); await c.close(); return r
 
-async def fetch_product(pid):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name,price,description FROM products WHERE id=?",(pid,))
-        row = await cur.fetchone(); await cur.close(); return row
+async def prod(pid):
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT name,price,description FROM products WHERE id=?",(pid,)); r=await c.fetchone(); await c.close(); return r
 
-def catalog_kb(products):
-    b = InlineKeyboardBuilder()
-    for p in products:
-        b.add(InlineKeyboardButton(text=f"{p[1]} — {p[2]} ₽", callback_data=f"view_{p[0]}"))
+def cat_kb(ps):
+    b=InlineKeyboardBuilder()
+    for p in ps: b.add(InlineKeyboardButton(text=f"{p[1]} — {p[2]} ₽",callback_data=f"v_{p[0]}"))
     b.adjust(1); return b.as_markup()
 
-async def send_backup(reason="ручной"):
-    if not os.path.exists(DB_PATH): return False
+async def backup(rs="ручной"):
+    if not os.path.exists(DB): return False
     try:
-        name = f"{BACKUP_DIR}/shop_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
-        shutil.copy2(DB_PATH, name)
-        size = round(os.path.getsize(name)/1024,1)
-        caption = f"💾 <b>Бэкап</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n📌 {reason}\n📦 {size} KB"
-
-        # В ЛС админу
-        if is_admin(ADMIN_ID):
+        n=f"{BD}/shop_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"; shutil.copy2(DB,n)
+        cap=f"💾 {datetime.now().strftime('%d.%m %H:%M')} | {rs} | {round(os.path.getsize(n)/1024,1)} KB"
+        if adm(AID):
+            try: await bot.send_document(AID,FSInputFile(n),caption=cap)
+            except: pass
+        if CH!=0:
             try:
-                await bot.send_document(ADMIN_ID, FSInputFile(name), caption=caption)
-            except Exception as e:
-                logger.error(f"backup to admin: {e}")
-
-        # В канал + пин
-        if BACKUP_CHANNEL_ID != 0:
-            try:
-                msg = await bot.send_document(BACKUP_CHANNEL_ID, FSInputFile(name), caption=caption)
-                try:
-                    await bot.pin_chat_message(BACKUP_CHANNEL_ID, msg.message_id, disable_notification=True)
-                except Exception as e:
-                    logger.warning(f"pin failed: {e}. Дай боту право 'Закреплять сообщения' в канале")
-            except Exception as e:
-                logger.error(f"backup to channel: {e}")
-
-        # Чистим локальные, оставляем 10
-        files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("shop_")], reverse=True)
-        for old in files[10:]:
-            try: os.remove(os.path.join(BACKUP_DIR, old))
+                m=await bot.send_document(CH,FSInputFile(n),caption=cap)
+                try: await bot.pin_chat_message(CH,m.message_id,disable_notification=True)
+                except: pass
+            except Exception as e: log.error(f"ch backup:{e}")
+        fs=sorted([f for f in os.listdir(BD) if f.startswith("shop_")],reverse=True)
+        for o in fs[10:]:
+            try: os.remove(os.path.join(BD,o))
             except: pass
         return True
-    except Exception as e:
-        logger.error(f"backup: {e}"); return False
+    except Exception as e: log.error(f"backup:{e}"); return False
 
-async def auto_backup_loop():
+async def ab_loop():
     await asyncio.sleep(60)
     while True:
-        try: await send_backup(f"авто ({BACKUP_INTERVAL_MIN} мин)")
-        except Exception as e: logger.error(f"auto_backup: {e}")
-        await asyncio.sleep(BACKUP_INTERVAL_MIN * 60)
+        try: await backup(f"авто {BIM}м")
+        except Exception as e: log.error(f"ab:{e}")
+        await asyncio.sleep(BIM*60)
 
-async def run_broadcast(admin_id, draft, users):
-    sent=blocked=failed=0
-    for uid in users:
+async def bcast(aid,df,us):
+    s=b=f=0
+    for u in us:
         try:
-            if draft["type"]=="text": await bot.send_message(uid, draft["text"])
-            elif draft["type"]=="photo": await bot.send_photo(uid, draft["photo_id"], caption=draft.get("caption") or None)
-            elif draft["type"]=="video": await bot.send_video(uid, draft["video_id"], caption=draft.get("caption") or None)
-            sent+=1
+            if df["type"]=="text": await bot.send_message(u,df["text"])
+            elif df["type"]=="photo": await bot.send_photo(u,df["photo_id"],caption=df.get("caption") or None)
+            else: await bot.send_video(u,df["video_id"],caption=df.get("caption") or None)
+            s+=1
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after+1)
             try:
-                if draft["type"]=="text": await bot.send_message(uid, draft["text"])
-                elif draft["type"]=="photo": await bot.send_photo(uid, draft["photo_id"], caption=draft.get("caption") or None)
-                elif draft["type"]=="video": await bot.send_video(uid, draft["video_id"], caption=draft.get("caption") or None)
-                sent+=1
-            except: failed+=1
-        except TelegramForbiddenError: blocked+=1
-        except Exception as e:
-            err=str(e).lower()
-            if "blocked" in err or "chat not found" in err or "deactivated" in err: blocked+=1
-            else: failed+=1; logger.warning(f"bc {uid}: {e}")
+                if df["type"]=="text": await bot.send_message(u,df["text"])
+                elif df["type"]=="photo": await bot.send_photo(u,df["photo_id"],caption=df.get("caption") or None)
+                else: await bot.send_video(u,df["video_id"],caption=df.get("caption") or None)
+                s+=1
+            except: f+=1
+        except TelegramForbiddenError: b+=1
+        except: f+=1
         await asyncio.sleep(0.05)
-    temp_broadcast.pop(admin_id, None)
-    try:
-        await bot.send_message(admin_id, f"📢 <b>Рассылка готова</b>\n✅ {sent}\n🚫 {blocked}\n❌ {failed}\n👥 {len(users)}")
+    TB.pop(aid,None)
+    try: await bot.send_message(aid,f"📢 Готово\n✅ {s}\n🚫 {b}\n❌ {f}")
     except: pass
 
 @dp.message(CommandStart())
-async def start_cmd(m):
-    user_states.pop(m.from_user.id, None)
-    await save_user(m.from_user)
-    await m.answer(f"👋 Привет, {m.from_user.first_name}!\nЭто S Mod Shop.\nВыбери действие:", reply_markup=main_menu())
+async def cmd_start(m):
+    US.pop(m.from_user.id,None); await save_u(m.from_user)
+    await m.answer(f"👋 Привет, {m.from_user.first_name}!\nS Mod Shop — выбери действие:",reply_markup=mmenu())
 
-@dp.message(F.text == "🛒 Заказать")
-async def catalog(m):
-    await save_user(m.from_user)
-    products = await fetch_products()
-    if not products: await m.answer("Товаров нет."); return
-    await m.answer("📦 Выбери товар:", reply_markup=catalog_kb(products))
+@dp.message(F.text=="🛒 Заказать")
+async def cmd_cat(m):
+    await save_u(m.from_user); ps=await prods()
+    if not ps: await m.answer("Товаров нет."); return
+    await m.answer("📦 Выбери:",reply_markup=cat_kb(ps))
 
-@dp.callback_query(F.data == "back_catalog")
-async def back_catalog(c):
-    products = await fetch_products()
-    if not products: await c.message.edit_text("Товаров нет."); await c.answer(); return
-    await c.message.edit_text("📦 Выбери товар:", reply_markup=catalog_kb(products)); await c.answer()
+@dp.callback_query(F.data=="back_cat")
+async def cb_back(c):
+    ps=await prods()
+    if not ps: await c.message.edit_text("Пусто."); await c.answer(); return
+    await c.message.edit_text("📦 Выбери:",reply_markup=cat_kb(ps)); await c.answer()
 
-@dp.callback_query(F.data.startswith("view_"))
-async def view_product(c):
-    try: pid = int(c.data.split("_")[1])
-    except: await c.answer("Ошибка", show_alert=True); return
-    p = await fetch_product(pid)
-    if not p: await c.answer("Нет", show_alert=True); return
-    b = InlineKeyboardBuilder()
-    b.add(InlineKeyboardButton(text="🛒 Купить", callback_data=f"buy_{pid}"))
-    b.add(InlineKeyboardButton(text="🧺 В корзину", callback_data=f"cart_{pid}"))
-    b.add(InlineKeyboardButton(text="🔙 Назад", callback_data="back_catalog"))
-    await c.message.edit_text(f"📦 {p[0]}\n💰 {p[1]} ₽\n📝 {p[2]}", reply_markup=b.as_markup())
-    await c.answer()
+@dp.callback_query(F.data.startswith("v_"))
+async def cb_view(c):
+    try: pid=int(c.data.split("_")[1])
+    except: await c.answer("err",show_alert=True); return
+    p=await prod(pid)
+    if not p: await c.answer("нет",show_alert=True); return
+    b=InlineKeyboardBuilder(); b.add(InlineKeyboardButton(text="🛒 Купить",callback_data=f"b_{pid}"),InlineKeyboardButton(text="🧺 В корзину",callback_data=f"c_{pid}"),InlineKeyboardButton(text="🔙 Назад",callback_data="back_cat")); b.adjust(1)
+    await c.message.edit_text(f"📦 {p[0]}\n💰 {p[1]} ₽\n📝 {p[2]}",reply_markup=b.as_markup()); await c.answer()
 
-@dp.callback_query(F.data.startswith("buy_"))
-async def process_buy(c):
-    try: pid = int(c.data.split("_")[1])
-    except: await c.answer("Ошибка", show_alert=True); return
-    p = await fetch_product(pid)
-    if not p: await c.answer("Нет", show_alert=True); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO orders(user_id,product,total,status) VALUES(?,?,?,?)",(c.from_user.id,p[0],p[1],"новый"))
-        await db.commit()
-    await c.message.answer(f"✅ Заказ: {p[0]} за {p[1]} ₽.")
-    if is_admin(ADMIN_ID):
-        try: await bot.send_message(ADMIN_ID, f"🛒 Заказ!\n{c.from_user.full_name} ({safe_username(c.from_user)})\n🆔 <code>{c.from_user.id}</code>\n{p[0]} — {p[1]} ₽\n<a href='tg://user?id={c.from_user.id}'>💬 Написать</a>")
+@dp.callback_query(F.data.startswith("b_"))
+async def cb_buy(c):
+    try: pid=int(c.data.split("_")[1])
+    except: await c.answer("err",show_alert=True); return
+    p=await prod(pid)
+    if not p: await c.answer("нет",show_alert=True); return
+    async with aiosqlite.connect(DB) as d:
+        await d.execute("INSERT INTO orders(user_id,product,total,status) VALUES(?,?,?,?)",(c.from_user.id,p[0],p[1],"новый")); await d.commit()
+    await c.message.answer(f"✅ Заказ: {p[0]} — {p[1]} ₽")
+    if adm(AID):
+        try: await bot.send_message(AID,f"🛒 Заказ\n{c.from_user.full_name} ({su(c.from_user)})\n🆔 <code>{c.from_user.id}</code>\n{p[0]} — {p[1]} ₽\n<a href='tg://user?id={c.from_user.id}'>💬 Написать</a>")
         except: pass
     await c.answer()
 
-@dp.callback_query(F.data.startswith("cart_"))
-async def add_cart(c):
-    try: pid = int(c.data.split("_")[1])
-    except: await c.answer("Ошибка", show_alert=True); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM cart WHERE user_id=? AND product_id=?",(c.from_user.id,pid))
-        if await cur.fetchone(): await cur.close(); await c.answer("Уже в корзине", show_alert=True); return
-        await cur.close()
-        await db.execute("INSERT INTO cart(user_id,product_id) VALUES(?,?)",(c.from_user.id,pid))
-        await db.commit()
-    await c.answer("✅ В корзине", show_alert=True)
+@dp.callback_query(F.data.startswith("c_"))
+async def cb_cart(c):
+    try: pid=int(c.data.split("_")[1])
+    except: await c.answer("err",show_alert=True); return
+    async with aiosqlite.connect(DB) as d:
+        cur=await d.execute("SELECT id FROM cart WHERE user_id=? AND product_id=?",(c.from_user.id,pid))
+        if await cur.fetchone(): await cur.close(); await c.answer("Уже в корзине",show_alert=True); return
+        await cur.close(); await d.execute("INSERT INTO cart(user_id,product_id) VALUES(?,?)",(c.from_user.id,pid)); await d.commit()
+    await c.answer("✅ В корзине",show_alert=True)
 
-@dp.message(F.text == "🧺 Корзина")
-async def show_cart(m):
-    await save_user(m.from_user)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT c.id,p.name,p.price FROM cart c JOIN products p ON c.product_id=p.id WHERE c.user_id=?",(m.from_user.id,))
-        items = await cur.fetchall(); await cur.close()
-    if not items: await m.answer("🧺 Пусто."); return
-    text = "🧺 Корзина:\n"; total = 0
-    for i in items: text += f"#{i[0]} {i[1]} — {i[2]} ₽\n"; total += i[2]
-    text += f"\n💰 {total} ₽"
-    b = InlineKeyboardBuilder()
-    b.add(InlineKeyboardButton(text="✅ Оформить", callback_data="checkout"))
-    b.add(InlineKeyboardButton(text="🗑 Очистить", callback_data="clear_cart"))
-    b.adjust(1)
-    await m.answer(text, reply_markup=b.as_markup())
+@dp.message(F.text=="🧺 Корзина")
+async def cmd_cart(m):
+    await save_u(m.from_user)
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT c.id,p.name,p.price FROM cart c JOIN products p ON c.product_id=p.id WHERE c.user_id=?",(m.from_user.id,)); it=await c.fetchall(); await c.close()
+    if not it: await m.answer("🧺 Пусто."); return
+    t="🧺 Корзина:\n"; tot=0
+    for i in it: t+=f"#{i[0]} {i[1]} — {i[2]} ₽\n"; tot+=i[2]
+    t+=f"\n💰 {tot} ₽"
+    b=InlineKeyboardBuilder(); b.add(InlineKeyboardButton(text="✅ Оформить",callback_data="chk"),InlineKeyboardButton(text="🗑 Очистить",callback_data="clr")); b.adjust(1)
+    await m.answer(t,reply_markup=b.as_markup())
 
-@dp.callback_query(F.data == "clear_cart")
-async def clear_cart(c):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM cart WHERE user_id=?",(c.from_user.id,)); await db.commit()
+@dp.callback_query(F.data=="clr")
+async def cb_clr(c):
+    async with aiosqlite.connect(DB) as d: await d.execute("DELETE FROM cart WHERE user_id=?",(c.from_user.id,)); await d.commit()
     await c.message.edit_text("🧺 Очищено."); await c.answer()
 
-@dp.callback_query(F.data == "checkout")
-async def checkout(c):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT p.name,p.price FROM cart c JOIN products p ON c.product_id=p.id WHERE c.user_id=?",(c.from_user.id,))
-        items = await cur.fetchall(); await cur.close()
-        if not items: await c.answer("Пусто", show_alert=True); return
-        txt = ", ".join(f"{i[0]} ({i[1]} ₽)" for i in items); total = sum(i[1] for i in items)
-        await db.execute("INSERT INTO orders(user_id,product,total,status) VALUES(?,?,?,?)",(c.from_user.id,txt,total,"новый"))
-        await db.execute("DELETE FROM cart WHERE user_id=?",(c.from_user.id,)); await db.commit()
-    await c.message.answer(f"✅ Заказ на {total} ₽:\n{txt}")
-    if is_admin(ADMIN_ID):
-        try: await bot.send_message(ADMIN_ID, f"🛒 Заказ из корзины!\n{c.from_user.full_name} ({safe_username(c.from_user)})\n🆔 <code>{c.from_user.id}</code>\n{txt}\n{total} ₽\n<a href='tg://user?id={c.from_user.id}'>💬 Написать</a>")
+@dp.callback_query(F.data=="chk")
+async def cb_chk(c):
+    async with aiosqlite.connect(DB) as d:
+        cur=await d.execute("SELECT p.name,p.price FROM cart c JOIN products p ON c.product_id=p.id WHERE c.user_id=?",(c.from_user.id,)); it=await cur.fetchall(); await cur.close()
+        if not it: await c.answer("Пусто",show_alert=True); return
+        tx=", ".join(f"{i[0]} ({i[1]} ₽)" for i in it); tot=sum(i[1] for i in it)
+        await d.execute("INSERT INTO orders(user_id,product,total,status) VALUES(?,?,?,?)",(c.from_user.id,tx,tot,"новый"))
+        await d.execute("DELETE FROM cart WHERE user_id=?",(c.from_user.id,)); await d.commit()
+    await c.message.answer(f"✅ Заказ на {tot} ₽:\n{tx}")
+    if adm(AID):
+        try: await bot.send_message(AID,f"🛒 Заказ (корзина)\n{c.from_user.full_name} ({su(c.from_user)})\n🆔 <code>{c.from_user.id}</code>\n{tx}\n{tot} ₽\n<a href='tg://user?id={c.from_user.id}'>💬 Написать</a>")
         except: pass
     await c.answer()
 
-@dp.message(F.text == "🔍 Поиск")
-async def search(m):
-    await save_user(m.from_user); user_states[m.from_user.id] = "awaiting_search"
-    await m.answer("🔍 Введи название:")
+@dp.message(F.text=="🔍 Поиск")
+async def cmd_search(m):
+    await save_u(m.from_user); US[m.from_user.id]="srch"; await m.answer("🔍 Название:")
 
-@dp.message(F.text == "👤 Профиль")
-async def profile(m):
-    await save_user(m.from_user)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM orders WHERE user_id=?",(m.from_user.id,))
-        cnt = (await cur.fetchone())[0]; await cur.close()
-    await m.answer(f"👤 ID: {m.from_user.id}\nИмя: {m.from_user.full_name}\nЗаказов: {cnt}")
+@dp.message(F.text=="👤 Профиль")
+async def cmd_prof(m):
+    await save_u(m.from_user)
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT COUNT(*) FROM orders WHERE user_id=?",(m.from_user.id,)); n=(await c.fetchone())[0]; await c.close()
+    await m.answer(f"👤 ID: {m.from_user.id}\nИмя: {m.from_user.full_name}\nЗаказов: {n}")
 
-@dp.message(F.text == "🆘 Поддержка")
-async def support(m):
-    await save_user(m.from_user); user_states[m.from_user.id] = "awaiting_support"
-    await m.answer("🆘 Напиши вопрос:")
+@dp.message(F.text=="🆘 Поддержка")
+async def cmd_sup(m):
+    await save_u(m.from_user); US[m.from_user.id]="sup"; await m.answer("🆘 Напиши вопрос:")
 
 @dp.message(Command("backup"))
-async def backup_cmd(m):
-    if not is_admin(m.from_user.id): return
-    await m.answer("💾 Делаю...")
-    if not await send_backup("ручной"): await m.answer("❌ Не вышло")
+async def cmd_bk(m):
+    if not adm(m.from_user.id): return
+    await m.answer("💾..."); await backup("ручной")
 
-@dp.message(F.text == "💾 Бэкап")
-async def backup_btn(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    await m.answer("💾 Делаю...")
-    if not await send_backup("кнопка"): await m.answer("❌ Не вышло")
+@dp.message(F.text=="💾 Бэкап")
+async def btn_bk(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    await m.answer("💾..."); await backup("кнопка")
 
 @dp.message(Command("restore"))
-async def restore_cmd(m):
-    if not is_admin(m.from_user.id): return
-    if not m.reply_to_message or not m.reply_to_message.document:
-        await m.answer("Ответь на .db файл командой /restore"); return
-    doc = m.reply_to_message.document
-    if not doc.file_name.endswith(".db"): await m.answer("Нужен .db"); return
+async def cmd_rs(m):
+    if not adm(m.from_user.id): return
+    if not m.reply_to_message or not m.reply_to_message.document: await m.answer("Ответь на .db /restore"); return
+    d=m.reply_to_message.document
+    if not d.file_name.endswith(".db"): await m.answer("Нужен .db"); return
     try:
-        f = await bot.get_file(doc.file_id); tmp = "restore_tmp.db"
-        await bot.download_file(f.file_path, tmp)
-        async with aiosqlite.connect(tmp) as t:
-            cur = await t.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = await cur.fetchall(); await cur.close()
-        if not tables: await m.answer("Пустой"); os.remove(tmp); return
-        if os.path.exists(DB_PATH): shutil.copy2(DB_PATH, f"{DB_PATH}.old")
-        shutil.move(tmp, DB_PATH)
-        await init_db()
-        await m.answer(f"✅ Восстановлено. Таблиц: {len(tables)}")
-        # Пиним свежий бэкап в канал, чтобы авто-восстановление взяло именно его
-        await send_backup("после /restore")
+        f=await bot.get_file(d.file_id); tmp="rt.db"; await bot.download_file(f.file_path,tmp)
+        if os.path.exists(DB): shutil.copy2(DB,DB+".old")
+        shutil.move(tmp,DB); await idb(); await m.answer("✅ Восстановлено"); await backup("после restore")
     except Exception as e: await m.answer(f"❌ {e}")
 
 @dp.message(Command("restore_channel"))
-async def restore_channel_cmd(m):
-    if not is_admin(m.from_user.id): return
-    await m.answer("💾 Восстанавливаю из канала...")
-    ok = await restore_from_channel()
-    if ok:
-        await init_db()
-        await m.answer("✅ База восстановлена из канала!")
-    else:
-        await m.answer("❌ Не удалось (нет закреплённого .db в канале?)")
+async def cmd_rsc(m):
+    if not adm(m.from_user.id): return
+    await m.answer("💾...")
+    if await restore_ch(): await idb(); await m.answer("✅ Восстановлено из канала")
+    else: await m.answer("❌ Нет закреплённого .db")
 
-@dp.message(F.text == "📢 Рассылка")
-async def bc_start(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    user_states[m.from_user.id] = "broadcast_content"
-    await m.answer("📢 Отправь текст/фото/видео.\n/cancel — отмена")
+@dp.message(F.text=="📢 Рассылка")
+async def cmd_bc(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    US[m.from_user.id]="bc"; await m.answer("📢 Текст/фото/видео. /cancel — отмена")
 
 @dp.message(Command("cancel"))
-async def cancel(m):
-    if not is_admin(m.from_user.id): return
-    user_states.pop(m.from_user.id, None); temp_broadcast.pop(m.from_user.id, None)
-    await m.answer("Отменено.", reply_markup=admin_menu())
+async def cmd_cn(m):
+    if not adm(m.from_user.id): return
+    US.pop(m.from_user.id,None); TB.pop(m.from_user Exception.id,None); await m.answer("Отменено.",reply_markup=amenu())
 
-@dp.callback_query(F.data == "broadcast_send")
-async def bc_send(c):
-    if not is_admin_state(c.from_user.id): await c.answer("Нет", show_alert=True); return
-    draft = temp_broadcast.get(c.from_user.id)
-    if not draft: await c.answer("Черновик потерян", show_alert=True); return
-    users = await fetch_all_users()
-    if not users: await c.message.edit_text("Нет юзеров"); await c.answer(); return
-    await c.message.edit_text(f"📢 Рассылка на {len(users)}...")
-    await c.answer()
-    asyncio.create_task(run_broadcast(c.from_user.id, draft, users))
+@dp.callback_query(F.data=="bc_go")
+async def cb_bcgo(c):
+    if not ast(c.from_user.id): await c.answer("нет",show_alert=True); return
+    df=TB.get(c.from_user.id)
+    if not df: await c.answer("Черновик потерян",show_alert=True); return
+    us=await all_u()
+    if not us: await c.message.edit_text("Нет юзеров"); await c.answer(); return
+    await c.message.edit_text(f"📢 Рассылка на {len(us)}..."); await c.answer()
+    asyncio.create_task(bcast(c.from_user.id,df,us))
 
-@dp.callback_query(F.data == "broadcast_cancel")
-async def bc_cancel(c):
-    temp_broadcast.pop(c.from_user.id, None); user_states.pop(c.from_user.id, None)
-    await c.message.edit_text("❌ Отменено."); await c.answer()
+@dp.callback_query(F.data=="bc_no")
+async def cb_bcno(c):
+    TB.pop(c.from_user.id,None); US.pop(c.from_user.id,None); await c.message.edit_text("❌ Отменено."); await c.answer()
 
 @dp.message(Command("admin"))
-async def admin_cmd(m):
-    if not is_admin(m.from_user.id): await m.answer("⛔ Нет доступа"); return
-    user_states[m.from_user.id] = "awaiting_password"; await m.answer("🔐 Пароль:")
+async def cmd_admin(m):
+    if not adm(m.from_user.id): await m.answer("⛔ Нет доступа"); return
+    US[m.from_user.id]="pwd"; await m.answer("🔐 Пароль:")
 
-@dp.message(F.text == "🔙 Выйти")
-async def exit_admin(m):
-    if not is_admin(m.from_user.id): return
-    admin_sessions.pop(m.from_user.id, None); user_states.pop(m.from_user.id, None)
-    await m.answer("Вышел.", reply_markup=main_menu())
+@dp.message(F.text=="🔙 Выйти")
+async def cmd_exit(m):
+    if not adm(m.from_user.id): return
+    AS.pop(m.from_user.id,None); US.pop(m.from_user.id,None); await m.answer("Вышел.",reply_markup=mmenu())
 
-@dp.message(F.text == "➕ Добавить товар")
-async def add_prod(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    user_states[m.from_user.id] = "product_name"; await m.answer("📝 Название:")
+@dp.message(F.text=="➕ Добавить товар")
+async def cmd_add(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    US[m.from_user.id]="pn"; await m.answer("📝 Название:")
 
-@dp.message(F.text == "🗑 Удалить товар")
-async def del_prod(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    ps = await fetch_products()
-    if not ps: await m.answer("Товаров нет."); return
-    txt = "🗑 ID для удаления:\n" + "\n".join(f"#{p[0]} {p[1]}" for p in ps)
-    user_states[m.from_user.id] = "delete_product"
-    await m.answer(txt + "\n\nВведи ID:")
+@dp.message(F.text=="🗑 Удалить товар")
+async def cmd_del(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    ps=await prods()
+    if not ps: await m.answer("Нет товаров"); return
+    US[m.from_user.id]="dp"; as await m e.answer("🗑 ID:\n":+"\n".join(f"#{ awaitp[0]} {p[1] m}" for p in ps))
 
-@dp.message(F.text == "📦 Товары")
-async def list_prods(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    ps = await fetch_products()
+@dp.message(F.text=="📦 Товары")
+async def cmd_lp(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    ps=await prods()
     if not ps: await m.answer("Пусто."); return
-    await m.answer("📦 Товары:\n" + "\n".join(f"#{p[0]} {p[1]} — {p[2]} ₽ ({p[3]})" for p in ps))
+    await m.answer("📦\n"+"\n".join(f"#{p[0]} {p[1]} — {p[2]} ₽ ({p[3]})" for p in ps))
 
-@dp.message(F.text == "📋 Заказы")
-async def list_orders(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id,user_id,product,total,status FROM orders ORDER BY id DESC LIMIT 20")
-        orders = await cur.fetchall(); await cur.close()
-    if not orders: await m.answer("Нет заказов."); return
-    await m.answer("📋 Заказы:\n" + "\n".join(f"#{o[0]} | {o[1]} | {o[2]} | {o[3]} ₽ | {o[4]}" for o in orders))
+@dp.message(F.text=="📋 Заказы")
+async def cmd_lo(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT id,user_id,product,total,status FROM orders ORDER BY id DESC LIMIT 20"); o=await c.fetchall(); await c.close()
+    if not o: await m.answer("Нет заказов"); return
+    await m.answer("📋\n"+"\n".join(f"#{x[0]} | {x[1]} | {x[2]} | {x[3]} ₽ | {x[4]}" for x in o))
 
-@dp.message(F.text == "💬 Тикеты")
-async def list_tickets(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id,user_id,message,answer FROM tickets ORDER BY id DESC LIMIT 20")
-        ts = await cur.fetchall(); await cur.close()
+@dp.message(F.text=="💬 Тикеты")
+async def cmd_lt(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT id,user_id,message,answer FROM tickets ORDER BY id DESC LIMIT 20"); ts=await c.fetchall(); await c.close()
     if not ts: await m.answer("Пусто."); return
-    txt = "💬 Тикеты:\n"
-    for t in ts: txt += f"#{t[0]} | {t[1]}\n❓ {t[2]}\n💬 {t[3] or '—'}\n\n"
-    await m.answer(txt)
+    t="💬\n"
+    for x in ts: t+=f"#{x[0]} | {x[1]}\n❓ {x[2]}\n💬 {x[3] or '—'}\n\n"
+    await m.answer(t)
 
-@dp.message(F.text == "📊 Состояние бота")
-async def status(m):
-    if not is_admin_state(m.from_user.id): await m.answer("⛔ /admin"); return
+@dp.message(F.text=="📊 Состояние бота")
+async def cmd_st(m):
+    if not ast(m.from_user.id): await m.answer("⛔ /admin"); return
     try:
-        ram = "н/д"
-        if sys.platform != "win32":
+        ram="н/д"
+        if sys.platform!="win32":
             import resource
-            ram = f"{round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,1)} MB"
-        up = int(time.time()-START_TIME); h = up//3600; mn = (up%3600)//60
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("SELECT COUNT(*) FROM products"); prods = (await cur.fetchone())[0]; await cur.close()
-            cur = await db.execute("SELECT COUNT(*) FROM orders"); ords = (await cur.fetchone())[0]; await cur.close()
-            cur = await db.execute("SELECT COUNT(*) FROM tickets"); tks = (await cur.fetchone())[0]; await cur.close()
-            cur = await db.execute("SELECT COUNT(*) FROM users"); us = (await cur.fetchone())[0]; await cur.close()
-        sz = round(os.path.getsize(DB_PATH)/1024,1) if os.path.exists(DB_PATH) else 0
-        chan = "✅" if BACKUP_CHANNEL_ID != 0 else "❌"
-        await m.answer(f"📊 Состояние\n━━━━━━━━━━━━\n🧠 RAM: {ram}\n⏱ {h}ч {mn}м\n💾 БД: {sz} KB\n📡 Канал: {chan}\n━━━━━━━━━━━━\n👥 {us}\n📦 {prods}\n📋 {ords}\n💬 {tks}\n━━━━━━━━━━━━\n🤖 OK")
-    except Exception as e: await m.answer(f"❌ {e}")
+            ram=f"{round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,1)} MB"
+        up=int(time.time()-ST); h=up//3600; mn=(up%3600)//60
+        async with aiosqlite.connect(DB) as d:
+            c=await d.execute("SELECT COUNT(*) FROM products"); p=(await c.fetchone())[0]; await c.close()
+            c=await d.execute("SELECT COUNT(*) FROM orders"); o=(await c.fetchone())[0]; await c.close()
+            c=await d.execute("SELECT COUNT(*) FROM tickets"); tk=(await c.fetchone())[0]; await c.close()
+            c=await d.execute("SELECT COUNT(*) FROM users"); u=(await c.fetchone())[0]; await c.close()
+        sz=round(os.path.getsize(DB)/1024,1) if os.path.exists(DB) else 0
+        ch="✅" if CH!=0 else "❌"
+        await m.answer(f"📊 Состояние\n━━━━━━━━━━━━\n🧠 {ram}\n⏱ {h}ч {mn}м\n💾 {sz} KB\n📡 {ch}\n━━━━━━━━━━━━\n👥 {u}\n📦 {p}\n📋 {o}\n💬 {tk}")
+    except.answer(f"❌ {e}")
 
 @dp.message(Command("answer"))
-async def ans_ticket(m):
-    if not is_admin(m.from_user.id): return
-    try:
-        parts = m.text.split(" ",2); tid = int(parts[1]); txt = parts[2]
-    except: await m.answer("Формат: /answer ID текст"); return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT user_id FROM tickets WHERE id=?",(tid,))
-        row = await cur.fetchone(); await cur.close()
-        if not row: await m.answer("Не найден"); return
-        await db.execute("UPDATE tickets SET answer=? WHERE id=?",(txt,tid)); await db.commit()
-    try:
-        await bot.send_message(row[0], f"📩 Ответ:\n{txt}"); await m.answer("✅ Отправлено")
+async def cmd_ans(m):
+    if not adm(m.from_user.id): return
+    try: parts=m.text.split(" ",2); tid=int(parts[1]); txt=parts[2]
+    except: await m.answer("/answer ID текст"); return
+    async with aiosqlite.connect(DB) as d:
+        c=await d.execute("SELECT user_id FROM tickets WHERE id=?",(tid,)); r=await c.fetchone(); await c.close()
+        if not r: await m.answer("Не найден"); return
+        await d.execute("UPDATE tickets SET answer=? WHERE id=?",(txt,tid)); await d.commit()
+    try: await bot.send_message(r[0],f"📩 Ответ:\n{txt}"); await m.answer("✅ Отправлено")
     except Exception as e: await m.answer(f"❌ {e}")
 
 @dp.message(F.photo | F.video)
-async def handle_media(m):
-    uid = m.from_user.id
-    if user_states.get(uid) != "broadcast_content" or not is_admin_state(uid): return
-    if m.photo: draft = {"type":"photo","photo_id":m.photo[-1].file_id,"caption":m.caption or ""}
-    else: draft = {"type":"video","video_id":m.video.file_id,"caption":m.caption or ""}
-    temp_broadcast[uid] = draft; user_states.pop(uid, None)
-    users = await fetch_all_users()
-    prev = f"[{'Фото' if draft['type']=='photo' else 'Видео'}] {(draft.get('caption') or '')[:100]}"
-    b = InlineKeyboardBuilder()
-    b.add(InlineKeyboardButton(text=f"✅ Отправить {len(users)}", callback_data="broadcast_send"))
-    b.add(InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")); b.adjust(1)
-    await m.answer(f"📢 <b>Проверь</b>\n👥 {len(users)}\n📄 {prev}", reply_markup=b.as_markup())
+async def h_media(m):
+    u=m.from_user.id
+    if US.get(u)!="bc" or not ast(u): return
+    if m.photo: df={"type":"photo","photo_id":m.photo[-1].file_id,"caption":m.caption or ""}
+    else: df={"type":"video","video_id":m.video.file_id,"caption":m.caption or ""}
+    TB[u]=df; US.pop(u,None)
+    us=await all_u()
+    b=InlineKeyboardBuilder(); b.add(InlineKeyboardButton(text=f"✅ Отправить {len(us)}",callback_data="bc_go"),InlineKeyboardButton(text="❌ Отмена",callback_data="bc_no")); b.adjust(1)
+    pv=f"[{'Фото' if df['type']=='photo' else 'Видео'}] {(df.get('caption') or '')[:80]}"
+    await m.answer(f"📢 Проверь\n👥 {len(us)}\n📄 {pv}",reply_markup=b.as_markup())
 
-@dp.message(F.text, ~F.text.startswith("/"), ~F.text.in_(BUTTONS_LIST))
-async def handle_input(m):
-    uid = m.from_user.id; state = user_states.get(uid)
+@dp.message(F.text,~F.text.startswith("/"),~F.text.in_(BTNS_L))
+async def h_input(m):
+    u=m.from_user.id; s=US.get(u)
 
-    if state == "broadcast_content":
-        if not is_admin_state(uid): return
-        temp_broadcast[uid] = {"type":"text","text":m.text}; user_states.pop(uid, None)
-        users = await fetch_all_users()
-        b = InlineKeyboardBuilder()
-        b.add(InlineKeyboardButton(text=f"✅ Отправить {len(users)}", callback_data="broadcast_send"))
-        b.add(InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")); b.adjust(1)
-        prev = m.text[:120] + ("..." if len(m.text)>120 else "")
-        await m.answer(f"📢 <b>Проверь</b>\n👥 {len(users)}\n📄 {prev}", reply_markup=b.as_markup()); return
+    if s=="bc":
+        if not ast(u): return
+        TB[u]={"type":"text","text":m.text}; US.pop(u,None)
+        us=await all_u()
+        b=InlineKeyboardBuilder(); b.add(InlineKeyboardButton(text=f"✅ Отправить {len(us)}",callback_data="bc_go"),InlineKeyboardButton(text="❌ Отмена",callback_data="bc_no")); b.adjust(1)
+        pv=m.text[:100]+("..." if len(m.text)>100 else "")
+        await m.answer(f"📢 Проверь\n👥 {len(us)}\n📄 {pv}",reply_markup=b.as_markup()); return
 
-    if state == "awaiting_password":
-        if not is_admin(uid): user_states.pop(uid,None); return
-        if m.text.strip() == ADMIN_PASSWORD:
-            admin_sessions[uid] = True; user_states.pop(uid, None)
-            await m.answer("🔧 Админ-панель:", reply_markup=admin_menu())
-        else:
-            user_states.pop(uid, None); await m.answer("❌ Неверно")
+    if s=="pwd":
+        if not adm(u): US.pop(u,None); return
+        if m.text.strip()==PWD: AS[u]=True; US.pop(u,None); await m.answer("🔧 Админ-панель:",reply_markup=amenu())
+        else: US.pop(u,None); await m.answer("❌ Неверно")
         return
 
-    if state == "product_name":
-        if not is_admin_state(uid): return
-        temp_product[uid] = {"name": m.text}; user_states[uid] = "product_price"
-        await m.answer("💰 Цена:"); return
+    if s=="pn":
+        if not ast(u): return
+        TP[u]={"name":m.text}; US[u]="pp"; await m.answer("💰 Цена:"); return
 
-    if state == "product_price":
-        if not is_admin_state(uid): return
+    if s=="pp":
+        if not ast(u): return
         if not m.text.strip().isdigit(): await m.answer("Число!"); return
-        temp_product[uid]["price"] = int(m.text.strip()); user_states[uid] = "product_desc"
-        await m.answer("📝 Описание:"); return
+        TP[u]["price"]=int(m.text.strip()); US[u]="pd"; await m.answer("📝 Описание:"); return
+
+    if s=="pd":
+        if not ast(u): return
+        TP[u]["desc"]=m.text; US[u]="pc"; await m.answer("📂 Категория:"); return
+
+    if s=="pc":
+        if not ast(u): return
+        TP[u]["category"]=m.text; p=TP.pop(u,None); US.pop(u,None)
+        if not p: await m.answer("Ошибка",reply_markup=amenu()); return
+        try:
+            async with aiosqlite.connect(DB) as d:
+                await d.execute("INSERT INTO products(name,price,description,category) VALUES(?,?,?,?)",(p["name"],p["price"],p["desc"],p["category"])); await d.commit()
+            await m.answer(f"✅ '{p['name']}' добавлен",reply_markup=amenu())
+        except Exception as e: await m.answer(f"❌ {e}",reply_markup=amenu())
+        return
+
+    if s=="dp":
+        if not ast(u): return
+        US.pop(u,None)
+        if not m.text.strip().isdigit(): await m.answer("ID числом",reply_markup=amenu()); return
+        pid=int(m.text.strip())
+        async with aiosqlite.connect(DB) as d:
+            await d.execute("DELETE FROM products WHERE id=?",(pid,)); await d.execute("DELETE FROM cart WHERE product_id=?",(pid,)); await d.commit()
+        await m.answer(f"✅ #{pid} удалён",reply_markup=amenu()); return
+
+    if s=="srch":
+        US.pop(u,None)
+        async with aiosqlite.connect(DB) as d:
+            c=await d.execute("SELECT id,name,price FROM products WHERE name LIKE ?",(f"%{m.text}%",)); r=await c.fetchall(); await c.close()
+        if not r: await m.answer("❌ Не найдено"); return
+        await m.answer("🔍\n"+"\n".join(f"#{x[0]} {x[1]} — {x[2]} ₽" for x in r)); return
+
+    if s=="sup":
+        US.pop(u,None)
+        async with aiosqlite.connect(DB) as d:
+            c=await d.execute("INSERT INTO tickets(user_id,message) VALUES(?,?)",(u,m.text)); tid=c.lastrowid; await c.close(); await d.commit()
+        if adm(AID):
+            try: await bot.send_message(AID,f"🆘 Тикет #{tid}\n{m.from_user.full_name} ({su(m.from_user)})\n🆔 <code>{m.from_user.id}</code>\n{m.text}\n\n/answer {tid} текст\n<a href='tg://user?id={m.from_user.id}'>💬 Написать</a>")
+            except: pass
+        await m.answer("✅ Отправлено"); return
+
+async def main():
+    if not await healthy() and not await has_data() and CH!=0:
+        log.warning("База пустая — восстанавливаю из канала"); await restore_ch()
+    await idb()
+    await bot.delete_webhook(drop_pending_updates=True)
+    Thread(target=run_flask,daemon=True).start()
+    asyncio.create_task(ab_loop())
+    asyncio.create_task(backup("запуск"))
+    log.info("Бот запущен")
+    try: await dp.start_polling(bot)
+    finally: await bot.session.close()
+
+if __name__=="__main__":
+    try: asyncio.run(main())
+    except (KeyboardInterrupt,SystemExit): log.info("Остановлен")
