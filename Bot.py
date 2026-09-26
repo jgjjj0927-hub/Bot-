@@ -25,6 +25,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 BACKUP_DIR = "backups"
+BACKUP_INTERVAL_MIN = 30
 
 START_TIME = time.time()
 
@@ -64,7 +65,8 @@ def run_flask():
 BUTTONS = {
     "🛒 Заказать", "🔍 Поиск", "🧺 Корзина", "👤 Профиль", "🆘 Поддержка",
     "➕ Добавить товар", "📦 Товары", "🗑 Удалить товар",
-    "📋 Заказы", "💬 Тикеты", "📊 Состояние бота", "💾 Бэкап", "🔙 Выйти",
+    "📋 Заказы", "💬 Тикеты", "📊 Состояние бота", "💾 Бэкап",
+    "📢 Рассылка", "🔙 Выйти",
 }
 BUTTONS_LIST = list(BUTTONS)
 
@@ -81,8 +83,8 @@ def admin_menu():
         [KeyboardButton(text="➕ Добавить товар")],
         [KeyboardButton(text="📦 Товары"), KeyboardButton(text="🗑 Удалить товар")],
         [KeyboardButton(text="📋 Заказы"), KeyboardButton(text="💬 Тикеты")],
-        [KeyboardButton(text="📊 Состояние бота"), KeyboardButton(text="💾 Бэкап")],
-        [KeyboardButton(text="🔙 Выйти")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="📊 Состояние бота")],
+        [KeyboardButton(text="💾 Бэкап"), KeyboardButton(text="🔙 Выйти")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -90,6 +92,7 @@ def admin_menu():
 user_states = {}
 admin_sessions = {}
 temp_product = {}
+temp_broadcast = {}
 
 # ===== ИНИЦИАЛИЗАЦИЯ БД =====
 async def init_db():
@@ -106,6 +109,9 @@ async def init_db():
         await db.execute('''CREATE TABLE IF NOT EXISTS tickets
                             (id INTEGER PRIMARY KEY AUTOINCREMENT,
                              user_id INTEGER, message TEXT, answer TEXT)''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS users
+                            (user_id INTEGER PRIMARY KEY,
+                             username TEXT, full_name TEXT, first_seen TEXT)''')
         await db.execute("CREATE INDEX IF NOT EXISTS idx_cart_user ON cart(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)")
@@ -120,6 +126,36 @@ def is_admin(user_id: int) -> bool:
 
 def is_admin_state(user_id: int) -> bool:
     return is_admin(user_id) and admin_sessions.get(user_id, False)
+
+async def save_user(user: types.User):
+    """Сохраняет пользователя в таблицу users (для рассылки)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id, username, full_name, first_seen) VALUES (?, ?, ?, ?)",
+                (user.id, user.username or "", user.full_name or "", datetime.now().isoformat())
+            )
+            await db.execute(
+                "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
+                (user.username or "", user.full_name or "", user.id)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"save_user error: {e}")
+
+async def fetch_all_users():
+    """Все уникальные user_id из users + orders + tickets (кроме админа)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute('''
+            SELECT user_id FROM users
+            UNION
+            SELECT user_id FROM orders
+            UNION
+            SELECT user_id FROM tickets
+        ''')
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r[0] for r in rows if r[0] != ADMIN_ID]
 
 async def fetch_products():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -150,10 +186,8 @@ def build_catalog_keyboard(products):
 # ===== БЭКАП =====
 async def send_backup(reason: str = "ручной"):
     if not is_admin(ADMIN_ID):
-        logger.warning("Бэкап невозможен: ADMIN_ID не задан")
         return False
     if not os.path.exists(DB_PATH):
-        logger.warning(f"Бэкап невозможен: файл {DB_PATH} не найден")
         return False
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -188,18 +222,58 @@ async def send_backup(reason: str = "ручной"):
         return False
 
 async def auto_backup_loop():
-    await asyncio.sleep(60)
+    await asyncio.sleep(60)  # первый через минуту
     while True:
         try:
-            await send_backup("авто (раз в 12ч)")
+            await send_backup(f"авто (раз в {BACKUP_INTERVAL_MIN} мин)")
         except Exception as e:
             logger.error(f"Автобэкап упал: {e}")
-        await asyncio.sleep(12 * 60 * 60)
+        await asyncio.sleep(BACKUP_INTERVAL_MIN * 60)
+
+# ===== РАССЫЛКА =====
+async def run_broadcast(admin_id: int, draft: dict, users: list):
+    sent = 0
+    blocked = 0
+    failed = 0
+
+    for uid in users:
+        try:
+            if draft["type"] == "text":
+                await bot.send_message(uid, draft["text"])
+            elif draft["type"] == "photo":
+                await bot.send_photo(uid, draft["photo_id"], caption=draft.get("caption") or None)
+            elif draft["type"] == "video":
+                await bot.send_video(uid, draft["video_id"], caption=draft.get("caption") or None)
+            sent += 1
+        except Exception as e:
+            err = str(e).lower()
+            if "blocked" in err or "chat not found" in err or "deactivated" in err:
+                blocked += 1
+            else:
+                failed += 1
+                logger.warning(f"Рассылка {uid} не удалась: {e}")
+        await asyncio.sleep(0.05)
+
+    temp_broadcast.pop(admin_id, None)
+
+    try:
+        await bot.send_message(
+            admin_id,
+            f"📢 <b>Рассылка завершена</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Доставлено: {sent}\n"
+            f"🚫 Заблокировали: {blocked}\n"
+            f"❌ Ошибок: {failed}\n"
+            f"👥 Всего: {len(users)}"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить отчёт: {e}")
 
 # ===== СТАРТ =====
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_states.pop(message.from_user.id, None)
+    await save_user(message.from_user)
     await message.answer(
         f"👋 Привет, {message.from_user.first_name}!\n"
         f"Это S Mod Shop — магазин вейпов.\n"
@@ -415,7 +489,7 @@ async def support(message: types.Message):
     user_states[message.from_user.id] = "awaiting_support"
     await message.answer("🆘 Напиши свой вопрос, я передам админу.")
 
-# ===== БЭКАП (команды и кнопка) =====
+# ===== БЭКАП =====
 @dp.message(Command("backup"))
 async def backup_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -475,6 +549,59 @@ async def restore_cmd(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка восстановления: {e}")
         logger.error(f"Ошибка restore: {e}")
+
+# ===== РАССЫЛКА =====
+@dp.message(F.text == "📢 Рассылка")
+async def broadcast_start(message: types.Message):
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
+        return
+    user_states[message.from_user.id] = "broadcast_content"
+    await message.answer(
+        "📢 <b>Рассылка</b>\n\n"
+        "Отправь текст, фото или видео — я разошлю это всем, "
+        "кто когда-либо запускал бота.\n\n"
+        "❌ Отмена: /cancel"
+    )
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    user_states.pop(message.from_user.id, None)
+    temp_broadcast.pop(message.from_user.id, None)
+    await message.answer("Отменено.", reply_markup=admin_menu())
+
+@dp.callback_query(F.data == "broadcast_send")
+async def broadcast_send(callback: types.CallbackQuery):
+    if not is_admin_state(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    draft = temp_broadcast.get(callback.from_user.id)
+    if not draft:
+        await callback.answer("Черновик потерян", show_alert=True)
+        return
+
+    users = await fetch_all_users()
+    if not users:
+        await callback.message.edit_text("❌ Нет пользователей для рассылки.")
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        f"📢 Рассылка запущена для {len(users)} пользователей...\n"
+        f"Отчёт придёт по завершении."
+    )
+    await callback.answer()
+    asyncio.create_task(run_broadcast(callback.from_user.id, draft, users))
+
+@dp.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel(callback: types.CallbackQuery):
+    temp_broadcast.pop(callback.from_user.id, None)
+    user_states.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ Рассылка отменена.")
+    await callback.answer()
 
 # ===== АДМИНКА =====
 @dp.message(Command("admin"))
@@ -586,6 +713,9 @@ async def bot_status(message: types.Message):
             cur = await db.execute("SELECT COUNT(*) FROM tickets")
             tickets = (await cur.fetchone())[0]
             await cur.close()
+            cur = await db.execute("SELECT COUNT(*) FROM users")
+            users_count = (await cur.fetchone())[0]
+            await cur.close()
 
         db_size = round(os.path.getsize(DB_PATH) / 1024, 1) if os.path.exists(DB_PATH) else 0
 
@@ -596,6 +726,7 @@ async def bot_status(message: types.Message):
             f"⏱ Uptime: {hours}ч {minutes}мин\n"
             f"💾 БД: {db_size} KB\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 Юзеров: {users_count}\n"
             f"📦 Товаров: {products}\n"
             f"📋 Заказов: {orders}\n"
             f"💬 Тикетов: {tickets}\n"
@@ -634,150 +765,45 @@ async def answer_ticket(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}")
 
-# ===== ВВОД ТЕКСТА =====
-@dp.message(F.text, ~F.text.startswith("/"), ~F.text.in_(BUTTONS_LIST))
+# ===== ВВОД ТЕКСТА / ФОТО / ВИДЕО =====
+@dp.message(F.text | F.photo | F.video)
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
-    if state == "awaiting_password":
-        if not is_admin(user_id):
-            user_states.pop(user_id, None)
+    # --- Рассылка: контент ---
+    if state == "broadcast_content":
+        if not is_admin_state(user_id):
             return
-        if message.text.strip() == ADMIN_PASSWORD:
-            admin_sessions[user_id] = True
-            user_states.pop(user_id, None)
-            await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
+
+        draft = None
+        if message.photo:
+            draft = {"type": "photo", "photo_id": message.photo[-1].file_id,
+                     "caption": message.caption or ""}
+        elif message.video:
+            draft = {"type": "video", "video_id": message.video.file_id,
+                     "caption": message.caption or ""}
+        elif message.text and not message.text.startswith("/"):
+            draft = {"type": "text", "text": message.text}
+
+        if not draft:
+            await message.answer("❌ Поддерживается только текст, фото или видео.")
+            return
+
+        temp_broadcast[user_id] = draft
+        user_states.pop(user_id, None)
+
+        users = await fetch_all_users()
+
+        if draft["type"] == "text":
+            preview = draft["text"][:120] + ("..." if len(draft["text"]) > 120 else "")
+        elif draft["type"] == "photo":
+            preview = f"[Фото] {(draft.get('caption') or '')[:100]}"
         else:
-            user_states.pop(user_id, None)
-            await message.answer("❌ Неверный пароль.")
-        return
+            preview = f"[Видео] {(draft.get('caption') or '')[:100]}"
 
-    if state == "product_name":
-        if not is_admin_state(user_id):
-            return
-        temp_product[user_id] = {"name": message.text}
-        user_states[user_id] = "product_price"
-        await message.answer("💰 Введи цену (только число):")
-        return
-
-    if state == "product_price":
-        if not is_admin_state(user_id):
-            return
-        if not message.text.strip().isdigit():
-            await message.answer("❌ Цена должна быть числом. Попробуй снова:")
-            return
-        temp_product[user_id]["price"] = int(message.text.strip())
-        user_states[user_id] = "product_desc"
-        await message.answer("📝 Введи описание:")
-        return
-
-    if state == "product_desc":
-        if not is_admin_state(user_id):
-            return
-        temp_product[user_id]["desc"] = message.text
-        user_states[user_id] = "product_category"
-        await message.answer("📂 Введи категорию (моды, жидкости, аксессуары):")
-        return
-
-    if state == "product_category":
-        if not is_admin_state(user_id):
-            return
-        temp_product[user_id]["category"] = message.text
-        p = temp_product.pop(user_id, None)
-        user_states.pop(user_id, None)
-        if p is None:
-            await message.answer("❌ Ошибка: данные товара потеряны.", reply_markup=admin_menu())
-            return
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "INSERT INTO products (name, price, description, category) VALUES (?, ?, ?, ?)",
-                    (p["name"], p["price"], p["desc"], p["category"])
-                )
-                await db.commit()
-            await message.answer(f"✅ Товар '{p['name']}' добавлен!", reply_markup=admin_menu())
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}", reply_markup=admin_menu())
-        return
-
-    if state == "delete_product":
-        if not is_admin_state(user_id):
-            return
-        user_states.pop(user_id, None)
-        if not message.text.strip().isdigit():
-            await message.answer("❌ ID должен быть числом.", reply_markup=admin_menu())
-            return
-        product_id = int(message.text.strip())
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM products WHERE id = ?", (product_id,))
-            await db.execute("DELETE FROM cart WHERE product_id = ?", (product_id,))
-            await db.commit()
-        await message.answer(f"✅ Товар #{product_id} удалён.", reply_markup=admin_menu())
-        return
-
-    if state == "awaiting_search":
-        user_states.pop(user_id, None)
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT id, name, price FROM products WHERE name LIKE ?",
-                (f"%{message.text}%",)
-            )
-            results = await cur.fetchall()
-            await cur.close()
-        if not results:
-            await message.answer("❌ Ничего не найдено.")
-            return
-        text = "🔍 Найдено:\n" + "\n".join([f"#{r[0]} {r[1]} — {r[2]} ₽" for r in results])
-        await message.answer(text)
-        return
-
-    if state == "awaiting_support":
-        user_states.pop(user_id, None)
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "INSERT INTO tickets (user_id, message) VALUES (?, ?)",
-                (user_id, message.text)
-            )
-            ticket_id = cur.lastrowid
-            await cur.close()
-            await db.commit()
-        if is_admin(ADMIN_ID):
-            try:
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"🆘 Тикет #{ticket_id}\n"
-                    f"От: {message.from_user.full_name} ({safe_username(message.from_user)})\n"
-                    f"🆔 ID: <code>{message.from_user.id}</code>\n"
-                    f"Сообщение: {message.text}\n\n"
-                    f"Ответь: /answer {ticket_id} текст\n"
-                    f"<a href='tg://user?id={message.from_user.id}'>💬 Написать клиенту</a>"
-                )
-            except Exception as e:
-                logger.error(f"Не удалось отправить тикет админу: {e}")
-        await message.answer("✅ Сообщение отправлено. Жди ответа.")
-        return
-
-# ===== ГЛАВНАЯ =====
-async def main():
-    await init_db()
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    Thread(target=run_flask, daemon=True).start()
-
-    asyncio.create_task(auto_backup_loop())
-
-    if is_admin(ADMIN_ID):
-        asyncio.create_task(send_backup("запуск бота"))
-
-    logger.info("Бот запущен")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен")
+        builder = InlineKeyboardBuilder()
+        builder.add(InlineKeyboardButton(
+            text=f"✅ Отправить {len(users)} чел.",
+            callback_data="broadcast_send"
+        ))
