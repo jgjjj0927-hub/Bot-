@@ -16,6 +16,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 BACKUP_DIR = "backups"
 BACKUP_INTERVAL_MIN = 30
+BACKUP_CHANNEL_ID = int(os.getenv("BACKUP_CHANNEL_ID", "0"))
 START_TIME = time.time()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -25,6 +26,8 @@ if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан")
 if ADMIN_ID == 0:
     logger.warning("ADMIN_ID = 0")
+if BACKUP_CHANNEL_ID == 0:
+    logger.warning("BACKUP_CHANNEL_ID не задан — авто-восстановление выключено")
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -68,6 +71,8 @@ admin_sessions = {}
 temp_product = {}
 temp_broadcast = {}
 
+REQUIRED_TABLES = ["products", "orders", "cart", "tickets", "users"]
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,price INTEGER,description TEXT,category TEXT)")
@@ -87,6 +92,70 @@ async def init_db():
                 logger.info("users заполнена из orders/tickets")
         except Exception as e:
             logger.error(f"init_db users migrate: {e}")
+
+async def db_is_healthy():
+    """Проверяет, что база содержит все нужные таблицы."""
+    if not os.path.exists(DB_PATH):
+        return False
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {r[0] for r in await cur.fetchall()}
+            await cur.close()
+        missing = [t for t in REQUIRED_TABLES if t not in tables]
+        if missing:
+            logger.warning(f"В базе нет таблиц: {missing}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"db_is_healthy: {e}")
+        return False
+
+async def restore_from_channel():
+    """Скачивает последний .db из канала бэкапов и подменяет shop.db."""
+    if BACKUP_CHANNEL_ID == 0:
+        logger.warning("BACKUP_CHANNEL_ID не задан")
+        return False
+    try:
+        # Ищем последние сообщения в канале (до 50), берём первое с .db
+        # Telegram Bot API не даёт истории чата, поэтому используем pinned_message или последнее известное
+        # Альтернатива: бот сам хранит message_id. Но если контейнер сброшен — мы его не знаем.
+        # Решение: при каждом бэкапе бот ПИНИТ сообщение в канале. При старте берём pinned.
+        chat = await bot.get_chat(BACKUP_CHANNEL_ID)
+        pinned = chat.pinned_message
+        if not pinned or not pinned.document:
+            logger.warning("В канале нет закреплённого бэкапа")
+            return False
+
+        doc = pinned.document
+        if not doc.file_name.endswith(".db"):
+            logger.warning(f"Закреплённый файл не .db: {doc.file_name}")
+            return False
+
+        file = await bot.get_file(doc.file_id)
+        tmp = "restore_from_channel.db"
+        await bot.download_file(file.file_path, tmp)
+
+        # Проверка, что это валидная SQLite
+        async with aiosqlite.connect(tmp) as t:
+            cur = await t.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = await cur.fetchall()
+            await cur.close()
+        if not tables:
+            logger.warning("Скачанный файл пустой")
+            os.remove(tmp)
+            return False
+
+        # Подмена
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, f"{DB_PATH}.before_auto_restore")
+        shutil.move(tmp, DB_PATH)
+
+        logger.info(f"✅ База восстановлена из канала ({len(tables)} таблиц)")
+        return True
+    except Exception as e:
+        logger.error(f"restore_from_channel: {e}")
+        return False
 
 def safe_username(u): return f"@{u.username}" if u.username else f"id{u.id}"
 def is_admin(uid): return ADMIN_ID != 0 and uid == ADMIN_ID
@@ -123,12 +192,32 @@ def catalog_kb(products):
     b.adjust(1); return b.as_markup()
 
 async def send_backup(reason="ручной"):
-    if not is_admin(ADMIN_ID) or not os.path.exists(DB_PATH): return False
+    if not os.path.exists(DB_PATH): return False
     try:
         name = f"{BACKUP_DIR}/shop_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.db"
         shutil.copy2(DB_PATH, name)
         size = round(os.path.getsize(name)/1024,1)
-        await bot.send_document(ADMIN_ID, FSInputFile(name), caption=f"💾 <b>Бэкап</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n📌 {reason}\n📦 {size} KB")
+        caption = f"💾 <b>Бэкап</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n📌 {reason}\n📦 {size} KB"
+
+        # Отправляем админу
+        if is_admin(ADMIN_ID):
+            try:
+                await bot.send_document(ADMIN_ID, FSInputFile(name), caption=caption)
+            except Exception as e:
+                logger.error(f"backup to admin: {e}")
+
+        # Отправляем в канал + пиним (для авто-восстановления)
+        if BACKUP_CHANNEL_ID != 0:
+            try:
+                msg = await bot.send_document(BACKUP_CHANNEL_ID, FSInputFile(name), caption=caption)
+                try:
+                    await bot.pin_chat_message(BACKUP_CHANNEL_ID, msg.message_id, disable_notification=True)
+                except Exception as e:
+                    logger.warning(f"pin: {e}")
+            except Exception as e:
+                logger.error(f"backup to channel: {e}")
+
+        # Чистим старые локальные файлы
         files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("shop_")], reverse=True)
         for old in files[10:]:
             try: os.remove(os.path.join(BACKUP_DIR, old))
@@ -313,8 +402,21 @@ async def restore_cmd(m):
         if not tables: await m.answer("Пустой"); os.remove(tmp); return
         if os.path.exists(DB_PATH): shutil.copy2(DB_PATH, f"{DB_PATH}.old")
         shutil.move(tmp, DB_PATH)
+        await init_db()
         await m.answer(f"✅ Восстановлено. Таблиц: {len(tables)}")
     except Exception as e: await m.answer(f"❌ {e}")
+
+@dp.message(Command("restore_channel"))
+async def restore_channel_cmd(m):
+    """Ручное восстановление из канала."""
+    if not is_admin(m.from_user.id): return
+    await m.answer("💾 Восстанавливаю из канала...")
+    ok = await restore_from_channel()
+    if ok:
+        await init_db()
+        await m.answer("✅ База восстановлена из канала!")
+    else:
+        await m.answer("❌ Не удалось (нет закреплённого .db в канале?)")
 
 @dp.message(F.text == "📢 Рассылка")
 async def bc_start(m):
@@ -411,7 +513,8 @@ async def status(m):
             cur = await db.execute("SELECT COUNT(*) FROM tickets"); tks = (await cur.fetchone())[0]; await cur.close()
             cur = await db.execute("SELECT COUNT(*) FROM users"); us = (await cur.fetchone())[0]; await cur.close()
         sz = round(os.path.getsize(DB_PATH)/1024,1) if os.path.exists(DB_PATH) else 0
-        await m.answer(f"📊 Состояние\n━━━━━━━━━━━━\n🧠 RAM: {ram}\n⏱ {h}ч {mn}м\n💾 БД: {sz} KB\n━━━━━━━━━━━━\n👥 {us}\n📦 {prods}\n📋 {ords}\n💬 {tks}\n━━━━━━━━━━━━\n🤖 OK")
+        chan = "✅" if BACKUP_CHANNEL_ID != 0 else "❌"
+        await m.answer(f"📊 Состояние\n━━━━━━━━━━━━\n🧠 RAM: {ram}\n⏱ {h}ч {mn}м\n💾 БД: {sz} KB\n📡 Канал: {chan}\n━━━━━━━━━━━━\n👥 {us}\n📦 {prods}\n📋 {ords}\n💬 {tks}\n━━━━━━━━━━━━\n🤖 OK")
     except Exception as e: await m.answer(f"❌ {e}")
 
 @dp.message(Command("answer"))
@@ -523,11 +626,21 @@ async def handle_input(m):
         await m.answer("✅ Отправлено"); return
 
 async def main():
+    # 1. Проверяем базу ДО init_db
+    healthy = await db_is_healthy()
+    if not healthy and BACKUP_CHANNEL_ID != 0:
+        logger.warning("База повреждена/отсутствует — пробую восстановить из канала")
+        restored = await restore_from_channel()
+        if restored:
+            logger.info("База успешно восстановлена из канала")
+        else:
+            logger.warning("Не удалось восстановить — создаю новую базу")
+
+    # 2. Инициализируем БД (создаст недостающие таблицы)
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     Thread(target=run_flask, daemon=True).start()
     asyncio.create_task(auto_backup_loop())
-    if is_admin(ADMIN_ID): asyncio.create_task(send_backup("запуск бота"))
     logger.info("Бот запущен")
     try: await dp.start_polling(bot)
     finally: await bot.session.close()
