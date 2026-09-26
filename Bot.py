@@ -11,6 +11,7 @@ from flask import Flask
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramRetryAfter, TelegramForbiddenError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -128,7 +129,6 @@ def is_admin_state(user_id: int) -> bool:
     return is_admin(user_id) and admin_sessions.get(user_id, False)
 
 async def save_user(user: types.User):
-    """Сохраняет пользователя в таблицу users (для рассылки)."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -144,7 +144,6 @@ async def save_user(user: types.User):
         logger.error(f"save_user error: {e}")
 
 async def fetch_all_users():
-    """Все уникальные user_id из users + orders + tickets (кроме админа)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute('''
             SELECT user_id FROM users
@@ -211,7 +210,7 @@ async def send_backup(reason: str = "ручной"):
             [f for f in os.listdir(BACKUP_DIR) if f.startswith("shop_")],
             reverse=True
         )
-        for old in files[5:]:
+        for old in files[10:]:
             try:
                 os.remove(os.path.join(BACKUP_DIR, old))
             except Exception:
@@ -222,7 +221,7 @@ async def send_backup(reason: str = "ручной"):
         return False
 
 async def auto_backup_loop():
-    await asyncio.sleep(60)  # первый через минуту
+    await asyncio.sleep(60)
     while True:
         try:
             await send_backup(f"авто (раз в {BACKUP_INTERVAL_MIN} мин)")
@@ -245,6 +244,21 @@ async def run_broadcast(admin_id: int, draft: dict, users: list):
             elif draft["type"] == "video":
                 await bot.send_video(uid, draft["video_id"], caption=draft.get("caption") or None)
             sent += 1
+        except TelegramRetryAfter as e:
+            logger.warning(f"Flood wait {e.retry_after}s")
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                if draft["type"] == "text":
+                    await bot.send_message(uid, draft["text"])
+                elif draft["type"] == "photo":
+                    await bot.send_photo(uid, draft["photo_id"], caption=draft.get("caption") or None)
+                elif draft["type"] == "video":
+                    await bot.send_video(uid, draft["video_id"], caption=draft.get("caption") or None)
+                sent += 1
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            blocked += 1
         except Exception as e:
             err = str(e).lower()
             if "blocked" in err or "chat not found" in err or "deactivated" in err:
@@ -284,6 +298,7 @@ async def start_cmd(message: types.Message):
 # ===== КАТАЛОГ =====
 @dp.message(F.text == "🛒 Заказать")
 async def catalog(message: types.Message):
+    await save_user(message.from_user)
     products = await fetch_products()
     if not products:
         await message.answer("Пока товаров нет. Загляни позже!")
@@ -393,6 +408,7 @@ async def add_to_cart(callback: types.CallbackQuery):
 # ===== КОРЗИНА =====
 @dp.message(F.text == "🧺 Корзина")
 async def show_cart(message: types.Message):
+    await save_user(message.from_user)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute('''SELECT c.id, p.name, p.price FROM cart c
                                   JOIN products p ON c.product_id = p.id
@@ -467,11 +483,13 @@ async def checkout(callback: types.CallbackQuery):
 # ===== ПОИСК, ПРОФИЛЬ, ПОДДЕРЖКА =====
 @dp.message(F.text == "🔍 Поиск")
 async def search_start(message: types.Message):
+    await save_user(message.from_user)
     user_states[message.from_user.id] = "awaiting_search"
     await message.answer("🔍 Напиши название товара для поиска:")
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(message: types.Message):
+    await save_user(message.from_user)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (message.from_user.id,))
         row = await cur.fetchone()
@@ -486,6 +504,7 @@ async def profile(message: types.Message):
 
 @dp.message(F.text == "🆘 Поддержка")
 async def support(message: types.Message):
+    await save_user(message.from_user)
     user_states[message.from_user.id] = "awaiting_support"
     await message.answer("🆘 Напиши свой вопрос, я передам админу.")
 
@@ -765,45 +784,40 @@ async def answer_ticket(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}")
 
-# ===== ВВОД ТЕКСТА / ФОТО / ВИДЕО =====
-@dp.message(F.text | F.photo | F.video)
-async def handle_input(message: types.Message):
+# ===== МЕДИА (только для рассылки) =====
+@dp.message(F.photo | F.video)
+async def handle_media(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
-    # --- Рассылка: контент ---
-    if state == "broadcast_content":
-        if not is_admin_state(user_id):
-            return
+    if state != "broadcast_content":
+        return
+    if not is_admin_state(user_id):
+        return
 
-        draft = None
-        if message.photo:
-            draft = {"type": "photo", "photo_id": message.photo[-1].file_id,
-                     "caption": message.caption or ""}
-        elif message.video:
-            draft = {"type": "video", "video_id": message.video.file_id,
-                     "caption": message.caption or ""}
-        elif message.text and not message.text.startswith("/"):
-            draft = {"type": "text", "text": message.text}
+    if message.photo:
+        draft = {"type": "photo", "photo_id": message.photo[-1].file_id,
+                 "caption": message.caption or ""}
+    else:
+        draft = {"type": "video", "video_id": message.video.file_id,
+                 "caption": message.caption or ""}
 
-        if not draft:
-            await message.answer("❌ Поддерживается только текст, фото или видео.")
-            return
+    temp_broadcast[user_id] = draft
+    user_states.pop(user_id, None)
 
-        temp_broadcast[user_id] = draft
-        user_states.pop(user_id, None)
+    users = await fetch_all_users()
+    if draft["type"] == "photo":
+        preview = f"[Фото] {(draft.get('caption') or '')[:100]}"
+    else:
+        preview = f"[Видео] {(draft.get('caption') or '')[:100]}"
 
-        users = await fetch_all_users()
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text=f"✅ Отправить {len(users)} чел.",
+        callback_data="broadcast_send"
+    ))
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel"))
+    builder.adjust(1)
 
-        if draft["type"] == "text":
-            preview = draft["text"][:120] + ("..." if len(draft["text"]) > 120 else "")
-        elif draft["type"] == "photo":
-            preview = f"[Фото] {(draft.get('caption') or '')[:100]}"
-        else:
-            preview = f"[Видео] {(draft.get('caption') or '')[:100]}"
-
-        builder = InlineKeyboardBuilder()
-        builder.add(InlineKeyboardButton(
-            text=f"✅ Отправить {len(users)} чел.",
-            callback_data="broadcast_send"
-        ))
+    await message.answer(
+        f"📢 <b>Проверь рассылку</
