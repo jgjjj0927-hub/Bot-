@@ -8,10 +8,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # Токен будет браться из переменных окружения (безопасно)
 import os
-TOKEN = os.getenv("8788841972:AAEgMOObpUqOcA9Rcxz8OnuB6MejEVsBBHg")
+TOKEN = os.getenv("BOT_TOKEN")
 
 # Админ ID (твой Telegram ID, узнать можно у @userinfobot)
-ADMIN_ID = int(os.getenv("8224529558", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Подключение к базе данных (файл создастся сам)
 conn = sqlite3.connect('shop.db')
