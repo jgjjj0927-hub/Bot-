@@ -76,6 +76,17 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,message TEXT,answer TEXT)")
         await db.execute("CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,username TEXT,full_name TEXT,first_seen TEXT)")
         await db.commit()
+        try:
+            cur = await db.execute("SELECT COUNT(*) FROM users")
+            cnt = (await cur.fetchone())[0]
+            await cur.close()
+            if cnt == 0:
+                await db.execute("INSERT OR IGNORE INTO users(user_id, username, full_name, first_seen) SELECT DISTINCT user_id, '', '', '' FROM orders")
+                await db.execute("INSERT OR IGNORE INTO users(user_id, username, full_name, first_seen) SELECT DISTINCT user_id, '', '', '' FROM tickets")
+                await db.commit()
+                logger.info("users заполнена из orders/tickets")
+        except Exception as e:
+            logger.error(f"init_db users migrate: {e}")
 
 def safe_username(u): return f"@{u.username}" if u.username else f"id{u.id}"
 def is_admin(uid): return ADMIN_ID != 0 and uid == ADMIN_ID
