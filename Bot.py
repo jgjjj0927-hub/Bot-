@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 import os
+import time
 from threading import Thread
 from flask import Flask
 
@@ -13,6 +14,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_PASSWORD = "96266"
+
+START_TIME = time.time()
 
 # ===== БАЗА ДАННЫХ =====
 conn = sqlite3.connect('shop.db', check_same_thread=False)
@@ -30,7 +33,7 @@ conn.commit()
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ===== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР (для Render) =====
+# ===== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР =====
 app = Flask(__name__)
 
 @app.route('/')
@@ -52,14 +55,15 @@ def main_menu():
 def admin_menu():
     kb = [
         [KeyboardButton(text="➕ Добавить товар")],
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📋 Заказы")],
-        [KeyboardButton(text="💬 Тикеты"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="🔙 Выйти")],
+        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="🗑 Удалить товар")],
+        [KeyboardButton(text="📋 Заказы"), KeyboardButton(text="💬 Тикеты")],
+        [KeyboardButton(text="📊 Состояние бота"), KeyboardButton(text="🔙 Выйти")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ===== СОСТОЯНИЯ =====
-user_states = {}  # {user_id: "awaiting_password" | "awaiting_product" | "awaiting_search"}
+user_states = {}
+temp_product = {}
 
 # ===== ЗАПУСК =====
 @dp.message(CommandStart())
@@ -167,7 +171,7 @@ async def show_cart(message: types.Message):
     for i in items:
         text += f"#{i[0]} {i[1]} — {i[2]} ₽\n"
         try:
-            total += int(i[2].replace("₽", "").strip())
+            total += int(str(i[2]).replace("₽", "").strip())
         except:
             pass
     text += f"\n💰 Итого: {total} ₽"
@@ -242,62 +246,86 @@ async def handle_input(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
-    # Поиск
+    # ===== ПАРОЛЬ =====
+    if state == "awaiting_password":
+        if message.text.strip() == ADMIN_PASSWORD:
+            user_states[user_id] = "admin"
+            await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
+        else:
+            user_states.pop(user_id, None)
+            await message.answer("❌ Неверный пароль.")
+        return
+
+    # ===== ДОБАВЛЕНИЕ ТОВАРА (ПО ШАГАМ) =====
+    if state == "product_name":
+        temp_product[user_id] = {"name": message.text}
+        user_states[user_id] = "product_price"
+        await message.answer("💰 Введи цену (только число):")
+        return
+
+    if state == "product_price":
+        temp_product[user_id]["price"] = message.text
+        user_states[user_id] = "product_desc"
+        await message.answer("📝 Введи описание:")
+        return
+
+    if state == "product_desc":
+        temp_product[user_id]["desc"] = message.text
+        user_states[user_id] = "product_category"
+        await message.answer("📂 Введи категорию (моды, жидкости, аксессуары):")
+        return
+
+    if state == "product_category":
+        temp_product[user_id]["category"] = message.text
+        p = temp_product.pop(user_id)
+        user_states[user_id] = "admin"
+        try:
+            cursor.execute(
+                "INSERT INTO products (name, price, description, category) VALUES (?, ?, ?, ?)",
+                (p["name"], p["price"], p["desc"], p["category"])
+            )
+            conn.commit()
+            await message.answer(f"✅ Товар '{p['name']}' добавлен!", reply_markup=admin_menu())
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}", reply_markup=admin_menu())
+        return
+
+    # ===== УДАЛЕНИЕ ТОВАРА =====
+    if state == "delete_product":
+        user_states[user_id] = "admin"
+        try:
+            product_id = int(message.text.strip())
+            cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+            conn.commit()
+            await message.answer(f"✅ Товар #{product_id} удалён.", reply_markup=admin_menu())
+        except Exception:
+            await message.answer("❌ Введи ID числом.", reply_markup=admin_menu())
+        return
+
+    # ===== ПОИСК =====
     if state == "awaiting_search":
         user_states.pop(user_id, None)
-        cursor.execute("SELECT id, name, price FROM products WHERE name LIKE ?",
-                       (f"%{message.text}%",))
+        cursor.execute("SELECT id, name, price FROM products WHERE name LIKE ?", (f"%{message.text}%",))
         results = cursor.fetchall()
         if not results:
             await message.answer("❌ Ничего не найдено.")
             return
-        text = "🔍 Найдено:\n"
-        for r in results:
-            text += f"#{r[0]} {r[1]} — {r[2]} ₽\n"
+        text = "🔍 Найдено:\n" + "\n".join([f"#{r[0]} {r[1]} — {r[2]} ₽" for r in results])
         await message.answer(text)
         return
 
-    # Поддержка
+    # ===== ПОДДЕРЖКА =====
     if state == "awaiting_support":
         user_states.pop(user_id, None)
-        cursor.execute("INSERT INTO tickets (user_id, message) VALUES (?, ?)",
-                       (user_id, message.text))
+        cursor.execute("INSERT INTO tickets (user_id, message) VALUES (?, ?)", (user_id, message.text))
         conn.commit()
         ticket_id = cursor.lastrowid
         await bot.send_message(
             ADMIN_ID,
-            f"🆘 Тикет #{ticket_id}\n"
-            f"От: {message.from_user.full_name} (@{message.from_user.username})\n"
-            f"Сообщение: {message.text}\n\n"
-            f"Ответь: /answer {ticket_id} текст"
+            f"🆘 Тикет #{ticket_id}\nОт: {message.from_user.full_name} (@{message.from_user.username})\n"
+            f"Сообщение: {message.text}\n\nОтветь: /answer {ticket_id} текст"
         )
         await message.answer("✅ Сообщение отправлено. Жди ответа.")
-        return
-
-    # Пароль админа
-    if state == "awaiting_password":
-        user_states.pop(user_id, None)
-        if message.text.strip() == ADMIN_PASSWORD:
-            await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
-        else:
-            await message.answer("❌ Неверный пароль.")
-        return
-
-    # Добавление товара
-    if state == "awaiting_product":
-        user_states.pop(user_id, None)
-        if user_id != ADMIN_ID:
-            return
-        try:
-            parts = message.text.split("|")
-            name, price, desc = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            category = parts[3].strip() if len(parts) > 3 else "без категории"
-            cursor.execute("INSERT INTO products (name, price, description, category) VALUES (?, ?, ?, ?)",
-                           (name, price, desc, category))
-            conn.commit()
-            await message.answer(f"✅ Товар '{name}' добавлен!")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}\nФормат: Название | Цена | Описание | Категория")
         return
 
 # ===== АДМИНКА =====
@@ -320,8 +348,21 @@ async def exit_admin(message: types.Message):
 async def add_product(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    user_states[message.from_user.id] = "awaiting_product"
-    await message.answer("Отправь товар:\nНазвание | Цена | Описание | Категория")
+    user_states[message.from_user.id] = "product_name"
+    await message.answer("📝 Введи название товара:")
+
+@dp.message(F.text == "🗑 Удалить товар")
+async def delete_product(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    cursor.execute("SELECT id, name FROM products")
+    products = cursor.fetchall()
+    if not products:
+        await message.answer("Товаров нет.")
+        return
+    text = "🗑 Выбери ID для удаления:\n" + "\n".join([f"#{p[0]} {p[1]}" for p in products])
+    user_states[message.from_user.id] = "delete_product"
+    await message.answer(text + "\n\nВведи ID:")
 
 @dp.message(F.text == "📦 Товары")
 async def list_products(message: types.Message):
@@ -332,9 +373,7 @@ async def list_products(message: types.Message):
     if not products:
         await message.answer("Товаров нет.")
         return
-    text = "📦 Товары:\n"
-    for p in products:
-        text += f"#{p[0]} {p[1]} — {p[2]} ₽ ({p[3]})\n"
+    text = "📦 Товары:\n" + "\n".join([f"#{p[0]} {p[1]} — {p[2]} ₽ ({p[3]})" for p in products])
     await message.answer(text)
 
 @dp.message(F.text == "📋 Заказы")
@@ -346,9 +385,7 @@ async def list_orders(message: types.Message):
     if not orders:
         await message.answer("Заказов нет.")
         return
-    text = "📋 Последние заказы:\n"
-    for o in orders:
-        text += f"#{o[0]} | user {o[1]} | {o[2]} | {o[3]}\n"
+    text = "📋 Последние заказы:\n" + "\n".join([f"#{o[0]} | user {o[1]} | {o[2]} | {o[3]}" for o in orders])
     await message.answer(text)
 
 @dp.message(F.text == "💬 Тикеты")
@@ -365,23 +402,43 @@ async def list_tickets(message: types.Message):
         text += f"#{t[0]} | user {t[1]}\n❓ {t[2]}\n💬 {t[3] or '—'}\n\n"
     await message.answer(text)
 
-@dp.message(F.text == "📊 Статистика")
-async def stats(message: types.Message):
+# ===== СОСТОЯНИЕ БОТА =====
+@dp.message(F.text == "📊 Состояние бота")
+async def bot_status(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    cursor.execute("SELECT COUNT(*) FROM products")
-    products = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM orders")
-    orders = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM tickets")
-    tickets = cursor.fetchone()[0]
-    await message.answer(
-        f"📊 Статистика:\n"
-        f"📦 Товаров: {products}\n"
-        f"📋 Заказов: {orders}\n"
-        f"💬 Тикетов: {tickets}"
-    )
+    try:
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        ram_used = round(usage.ru_maxrss / 1024, 1)
+        uptime = int(time.time() - START_TIME)
+        hours = uptime // 3600
+        minutes = (uptime % 3600) // 60
 
+        cursor.execute("SELECT COUNT(*) FROM products")
+        products = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM orders")
+        orders = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM tickets")
+        tickets = cursor.fetchone()[0]
+
+        text = (
+            f"📊 Состояние бота\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🧠 RAM: {ram_used} MB\n"
+            f"⏱ Uptime: {hours}ч {minutes}мин\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Товаров: {products}\n"
+            f"📋 Заказов: {orders}\n"
+            f"💬 Тикетов: {tickets}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 Бот работает стабильно"
+        )
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+# ===== ОТВЕТ НА ТИКЕТ =====
 @dp.message(Command("answer"))
 async def answer_ticket(message: types.Message):
     if message.from_user.id != ADMIN_ID:
