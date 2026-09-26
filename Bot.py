@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # ===== КОНФИГ =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
 DB_PATH = "shop.db"
 
 START_TIME = time.time()
@@ -27,8 +27,6 @@ logger = logging.getLogger(__name__)
 # ===== ПРОВЕРКИ =====
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN не задан в Environment Variables")
-if not ADMIN_PASSWORD:
-    raise RuntimeError("ADMIN_PASSWORD не задан в Environment Variables")
 if ADMIN_ID == 0:
     logger.warning("ADMIN_ID = 0. Админ-панель будет недоступна.")
 
