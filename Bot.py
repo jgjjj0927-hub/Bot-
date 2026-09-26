@@ -1,22 +1,29 @@
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import time
+from datetime import datetime
 from threading import Thread
 from flask import Flask
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    FSInputFile
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ===== КОНФИГ =====
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "96266")
-DB_PATH = "shop.db"
+DB_PATH = os.getenv("DB_PATH", "shop.db")
+BACKUP_DIR = "backups"
 
 START_TIME = time.time()
 
@@ -30,8 +37,10 @@ if not TOKEN:
 if ADMIN_ID == 0:
     logger.warning("ADMIN_ID = 0. Админ-панель будет недоступна.")
 
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
 # ===== BOT & DISPATCHER =====
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # ===== FLASK =====
@@ -51,7 +60,7 @@ def run_flask():
 BUTTONS = {
     "🛒 Заказать", "🔍 Поиск", "🧺 Корзина", "👤 Профиль", "🆘 Поддержка",
     "➕ Добавить товар", "📦 Товары", "🗑 Удалить товар",
-    "📋 Заказы", "💬 Тикеты", "📊 Состояние бота", "🔙 Выйти",
+    "📋 Заказы", "💬 Тикеты", "📊 Состояние бота", "💾 Бэкап", "🔙 Выйти",
 }
 BUTTONS_LIST = list(BUTTONS)
 
@@ -68,13 +77,14 @@ def admin_menu():
         [KeyboardButton(text="➕ Добавить товар")],
         [KeyboardButton(text="📦 Товары"), KeyboardButton(text="🗑 Удалить товар")],
         [KeyboardButton(text="📋 Заказы"), KeyboardButton(text="💬 Тикеты")],
-        [KeyboardButton(text="📊 Состояние бота"), KeyboardButton(text="🔙 Выйти")],
+        [KeyboardButton(text="📊 Состояние бота"), KeyboardButton(text="💾 Бэкап")],
+        [KeyboardButton(text="🔙 Выйти")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ===== СОСТОЯНИЯ =====
-user_states = {}        # текущее действие пользователя (product_name, awaiting_search и т.д.)
-admin_sessions = {}     # кто авторизован как админ (ОТДЕЛЬНО!)
+user_states = {}
+admin_sessions = {}
 temp_product = {}
 
 # ===== ИНИЦИАЛИЗАЦИЯ БД =====
@@ -105,7 +115,6 @@ def is_admin(user_id: int) -> bool:
     return ADMIN_ID != 0 and user_id == ADMIN_ID
 
 def is_admin_state(user_id: int) -> bool:
-    """Проверяет, авторизован ли админ (ввёл пароль)."""
     return is_admin(user_id) and admin_sessions.get(user_id, False)
 
 async def fetch_products():
@@ -134,11 +143,62 @@ def build_catalog_keyboard(products):
     builder.adjust(1)
     return builder.as_markup()
 
+# ===== БЭКАП =====
+async def send_backup(reason: str = "ручной"):
+    """Отправляет shop.db админу в ЛС."""
+    if not is_admin(ADMIN_ID):
+        logger.warning("Бэкап невозможен: ADMIN_ID не задан")
+        return False
+    if not os.path.exists(DB_PATH):
+        logger.warning(f"Бэкап невозможен: файл {DB_PATH} не найден")
+        return False
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        backup_name = f"{BACKUP_DIR}/shop_{timestamp}.db"
+        shutil.copy2(DB_PATH, backup_name)
+
+        size_kb = round(os.path.getsize(backup_name) / 1024, 1)
+        await bot.send_document(
+            ADMIN_ID,
+            FSInputFile(backup_name),
+            caption=(
+                f"💾 <b>Бэкап базы данных</b>\n"
+                f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"📌 Причина: {reason}\n"
+                f"📦 Размер: {size_kb} KB"
+            )
+        )
+        logger.info(f"Бэкап отправлен: {backup_name}")
+
+        # Чистим старые бэкапы (оставляем 5 последних)
+        files = sorted(
+            [f for f in os.listdir(BACKUP_DIR) if f.startswith("shop_")],
+            reverse=True
+        )
+        for old in files[5:]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка бэкапа: {e}")
+        return False
+
+async def auto_backup_loop():
+    """Автобэкап раз в 12 часов."""
+    await asyncio.sleep(60)  # первый бэкап через минуту после старта
+    while True:
+        try:
+            await send_backup("авто (раз в 12ч)")
+        except Exception as e:
+            logger.error(f"Автобэкап упал: {e}")
+        await asyncio.sleep(12 * 60 * 60)
+
 # ===== СТАРТ =====
 @dp.message(CommandStart())
 async def start_cmd(message: types.Message):
     user_states.pop(message.from_user.id, None)
-    # admin_sessions НЕ трогаем — админ остаётся админом
     await message.answer(
         f"👋 Привет, {message.from_user.first_name}!\n"
         f"Это S Mod Shop — магазин вейпов.\n"
@@ -216,7 +276,9 @@ async def process_buy(callback: types.CallbackQuery):
                 ADMIN_ID,
                 f"🛒 Новый заказ!\n"
                 f"Клиент: {callback.from_user.full_name} ({safe_username(callback.from_user)})\n"
-                f"Товар: {p[0]}\nЦена: {p[1]} ₽"
+                f"🆔 ID: <code>{callback.from_user.id}</code>\n"
+                f"Товар: {p[0]}\nЦена: {p[1]} ₽\n\n"
+                f"<a href='tg://user?id={callback.from_user.id}'>💬 Написать клиенту</a>"
             )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление админу: {e}")
@@ -318,8 +380,10 @@ async def checkout(callback: types.CallbackQuery):
                 ADMIN_ID,
                 f"🛒 Новый заказ (корзина)!\n"
                 f"Клиент: {callback.from_user.full_name} ({safe_username(callback.from_user)})\n"
+                f"🆔 ID: <code>{callback.from_user.id}</code>\n"
                 f"Товары: {products_text}\n"
-                f"Итого: {total} ₽"
+                f"Итого: {total} ₽\n\n"
+                f"<a href='tg://user?id={callback.from_user.id}'>💬 Написать клиенту</a>"
             )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление админу: {e}")
@@ -349,6 +413,70 @@ async def profile(message: types.Message):
 async def support(message: types.Message):
     user_states[message.from_user.id] = "awaiting_support"
     await message.answer("🆘 Напиши свой вопрос, я передам админу.")
+
+# ===== БЭКАП (команды и кнопка) =====
+@dp.message(Command("backup"))
+async def backup_cmd(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("💾 Готовлю бэкап...")
+    ok = await send_backup("ручной (/backup)")
+    if not ok:
+        await message.answer("❌ Не удалось сделать бэкап.")
+
+@dp.message(F.text == "💾 Бэкап")
+async def backup_button(message: types.Message):
+    if not is_admin_state(message.from_user.id):
+        await message.answer("⛔ Сначала авторизуйся: /admin")
+        return
+    await message.answer("💾 Готовлю бэкап...")
+    ok = await send_backup("ручной (кнопка)")
+    if not ok:
+        await message.answer("❌ Не удалось сделать бэкап.")
+
+@dp.message(Command("restore"))
+async def restore_cmd(message: types.Message):
+    """Ответь на .db-файл командой /restore — база восстановится."""
+    if not is_admin(message.from_user.id):
+        return
+    if not message.reply_to_message or not message.reply_to_message.document:
+        await message.answer("❌ Ответь на файл shop.db командой /restore")
+        return
+
+    doc = message.reply_to_message.document
+    if not doc.file_name.endswith(".db"):
+        await message.answer("❌ Файл должен быть .db")
+        return
+
+    try:
+        file = await bot.get_file(doc.file_id)
+        tmp_path = "restore_tmp.db"
+        await bot.download_file(file.file_path, tmp_path)
+
+        # Проверяем, что это валидная SQLite-база
+        async with aiosqlite.connect(tmp_path) as test_db:
+            cur = await test_db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = await cur.fetchall()
+            await cur.close()
+        if not tables:
+            await message.answer("❌ Файл пустой или не SQLite")
+            os.remove(tmp_path)
+            return
+
+        # Бэкапим текущую и подменяем
+        if os.path.exists(DB_PATH):
+            shutil.copy2(DB_PATH, f"{DB_PATH}.old")
+        shutil.move(tmp_path, DB_PATH)
+
+        await message.answer(
+            f"✅ База восстановлена!\n"
+            f"📦 Таблиц: {len(tables)}\n"
+            f"Старая база сохранена как {DB_PATH}.old"
+        )
+        logger.info("База восстановлена из бэкапа")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка восстановления: {e}")
+        logger.error(f"Ошибка restore: {e}")
 
 # ===== АДМИНКА =====
 @dp.message(Command("admin"))
@@ -461,11 +589,14 @@ async def bot_status(message: types.Message):
             tickets = (await cur.fetchone())[0]
             await cur.close()
 
+        db_size = round(os.path.getsize(DB_PATH) / 1024, 1) if os.path.exists(DB_PATH) else 0
+
         text = (
             f"📊 Состояние бота\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🧠 RAM: {ram_used}\n"
             f"⏱ Uptime: {hours}ч {minutes}мин\n"
+            f"💾 БД: {db_size} KB\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 Товаров: {products}\n"
             f"📋 Заказов: {orders}\n"
@@ -505,27 +636,25 @@ async def answer_ticket(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}")
 
-# ===== ВВОД ТЕКСТА (В САМОМ КОНЦЕ!) =====
+# ===== ВВОД ТЕКСТА =====
 @dp.message(F.text, ~F.text.startswith("/"), ~F.text.in_(BUTTONS_LIST))
 async def handle_input(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
 
-    # Пароль
     if state == "awaiting_password":
         if not is_admin(user_id):
             user_states.pop(user_id, None)
             return
         if message.text.strip() == ADMIN_PASSWORD:
-            admin_sessions[user_id] = True          # <-- авторизация
-            user_states.pop(user_id, None)          # <-- состояние очищено
+            admin_sessions[user_id] = True
+            user_states.pop(user_id, None)
             await message.answer("🔧 Доступ разрешён. Админ-панель:", reply_markup=admin_menu())
         else:
             user_states.pop(user_id, None)
             await message.answer("❌ Неверный пароль.")
         return
 
-    # Добавление товара
     if state == "product_name":
         if not is_admin_state(user_id):
             return
@@ -558,7 +687,7 @@ async def handle_input(message: types.Message):
             return
         temp_product[user_id]["category"] = message.text
         p = temp_product.pop(user_id, None)
-        user_states.pop(user_id, None)      # <-- очищаем, админ-статус в admin_sessions
+        user_states.pop(user_id, None)
         if p is None:
             await message.answer("❌ Ошибка: данные товара потеряны.", reply_markup=admin_menu())
             return
@@ -574,7 +703,6 @@ async def handle_input(message: types.Message):
             await message.answer(f"❌ Ошибка: {e}", reply_markup=admin_menu())
         return
 
-    # Удаление товара
     if state == "delete_product":
         if not is_admin_state(user_id):
             return
@@ -590,7 +718,6 @@ async def handle_input(message: types.Message):
         await message.answer(f"✅ Товар #{product_id} удалён.", reply_markup=admin_menu())
         return
 
-    # Поиск
     if state == "awaiting_search":
         user_states.pop(user_id, None)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -607,7 +734,6 @@ async def handle_input(message: types.Message):
         await message.answer(text)
         return
 
-    # Поддержка
     if state == "awaiting_support":
         user_states.pop(user_id, None)
         async with aiosqlite.connect(DB_PATH) as db:
@@ -624,8 +750,10 @@ async def handle_input(message: types.Message):
                     ADMIN_ID,
                     f"🆘 Тикет #{ticket_id}\n"
                     f"От: {message.from_user.full_name} ({safe_username(message.from_user)})\n"
+                    f"🆔 ID: <code>{message.from_user.id}</code>\n"
                     f"Сообщение: {message.text}\n\n"
-                    f"Ответь: /answer {ticket_id} текст"
+                    f"Ответь: /answer {ticket_id} текст\n"
+                    f"<a href='tg://user?id={message.from_user.id}'>💬 Написать клиенту</a>"
                 )
             except Exception as e:
                 logger.error(f"Не удалось отправить тикет админу: {e}")
@@ -636,7 +764,17 @@ async def handle_input(message: types.Message):
 async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # Запускаем Flask
     Thread(target=run_flask, daemon=True).start()
+
+    # Фоновый автобэкап
+    asyncio.create_task(auto_backup_loop())
+
+    # Первый бэкап сразу после старта
+    if is_admin(ADMIN_ID):
+        asyncio.create_task(send_backup("запуск бота"))
+
     logger.info("Бот запущен")
     try:
         await dp.start_polling(bot)
