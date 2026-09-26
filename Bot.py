@@ -10,6 +10,7 @@ from flask import Flask
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -40,7 +41,10 @@ if ADMIN_ID == 0:
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # ===== BOT & DISPATCHER =====
-bot = Bot(token=TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher()
 
 # ===== FLASK =====
@@ -145,7 +149,6 @@ def build_catalog_keyboard(products):
 
 # ===== БЭКАП =====
 async def send_backup(reason: str = "ручной"):
-    """Отправляет shop.db админу в ЛС."""
     if not is_admin(ADMIN_ID):
         logger.warning("Бэкап невозможен: ADMIN_ID не задан")
         return False
@@ -170,7 +173,6 @@ async def send_backup(reason: str = "ручной"):
         )
         logger.info(f"Бэкап отправлен: {backup_name}")
 
-        # Чистим старые бэкапы (оставляем 5 последних)
         files = sorted(
             [f for f in os.listdir(BACKUP_DIR) if f.startswith("shop_")],
             reverse=True
@@ -186,8 +188,7 @@ async def send_backup(reason: str = "ручной"):
         return False
 
 async def auto_backup_loop():
-    """Автобэкап раз в 12 часов."""
-    await asyncio.sleep(60)  # первый бэкап через минуту после старта
+    await asyncio.sleep(60)
     while True:
         try:
             await send_backup("авто (раз в 12ч)")
@@ -436,7 +437,6 @@ async def backup_button(message: types.Message):
 
 @dp.message(Command("restore"))
 async def restore_cmd(message: types.Message):
-    """Ответь на .db-файл командой /restore — база восстановится."""
     if not is_admin(message.from_user.id):
         return
     if not message.reply_to_message or not message.reply_to_message.document:
@@ -453,7 +453,6 @@ async def restore_cmd(message: types.Message):
         tmp_path = "restore_tmp.db"
         await bot.download_file(file.file_path, tmp_path)
 
-        # Проверяем, что это валидная SQLite-база
         async with aiosqlite.connect(tmp_path) as test_db:
             cur = await test_db.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = await cur.fetchall()
@@ -463,7 +462,6 @@ async def restore_cmd(message: types.Message):
             os.remove(tmp_path)
             return
 
-        # Бэкапим текущую и подменяем
         if os.path.exists(DB_PATH):
             shutil.copy2(DB_PATH, f"{DB_PATH}.old")
         shutil.move(tmp_path, DB_PATH)
@@ -765,13 +763,10 @@ async def main():
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Запускаем Flask
     Thread(target=run_flask, daemon=True).start()
 
-    # Фоновый автобэкап
     asyncio.create_task(auto_backup_loop())
 
-    # Первый бэкап сразу после старта
     if is_admin(ADMIN_ID):
         asyncio.create_task(send_backup("запуск бота"))
 
